@@ -1,0 +1,96 @@
+---
+name: everloop
+description: >
+  Manage persistent Claude Code loops backed by systemd user timers — recurring
+  instructions that never expire and survive reboots, with no external service.
+  Use when the user says "everloop", wants a durable/persistent loop, a loop that
+  "doesn't expire" or "outlives /loop", a systemd-backed recurring task, or asks
+  to create/list/update/delete such loops or push an ad-hoc message into a
+  listening session.
+---
+
+# everloop — persistent loops for Claude Code (systemd-backed)
+
+everloop replaces the built-in `/loop` (whose CronCreate schedule expires after
+~7 days) with **systemd user timers**, so a recurring instruction fires forever
+— across session restarts and reboots — with no external service.
+
+- **Repo & source:** `~/projects/52labs/everloop`
+- **Binary:** `~/.local/bin/everloop` (rebuild with `cd ~/projects/52labs/everloop && go build -o ~/.local/bin/everloop .`)
+- **State:** loop defs + spool in `~/.local/share/everloop/`; units in `~/.config/systemd/user/everloop-<name>.{timer,service}`
+
+## How it works
+
+One Go binary, three roles:
+
+- `everloop serve` — the MCP **channel** server Claude Code spawns over stdio.
+  Declares `claude/channel`, drains the spool every ~2s, and pushes each firing
+  into the session as `<channel source="everloop" ...>`. Also exposes the loop
+  management tools below.
+- `everloop tick <name>` — what each systemd timer runs; spools one firing.
+  Coalescing: at most one pending tick per loop, so an outage never floods the
+  session (repeat fires bump `coalesced_count`).
+- CLI — `create` / `list` / `update` / `delete` / `send`.
+
+Delivery is at-least-once (claim → notify → ack); each event carries an
+`event_id` meta attribute usable as an idempotency key.
+
+## Managing loops
+
+The channel server, when connected, exposes these MCP tools (prefer them inside
+a session): `create_loop`, `list_loops`, `update_loop`, `delete_loop`,
+`send_message`. If the server is not connected, or you're acting from a shell,
+use the CLI — it is the same operations:
+
+```bash
+# interval loop (90s, 5m, 1h30m, 2d — minimum 10s)
+everloop create reconcile --message "Reconcile the ledger and report anomalies." --every 1h
+
+# calendar loop (systemd OnCalendar syntax; a fire missed while off runs at next boot)
+everloop create standup --message "Draft the daily standup summary." --calendar "Mon..Fri 09:00"
+
+everloop list
+everloop update reconcile --every 30m          # reschedules from now
+everloop update reconcile --disable            # stop without deleting
+everloop update reconcile --enable
+everloop delete reconcile
+
+# push an ad-hoc message into the currently-listening session from any process
+everloop send "deploy finished: v1.2.3"
+```
+
+Exactly one of `--every` / `--calendar` per loop; setting one clears the other.
+Names are lowercase letters, digits, hyphens (≤41 chars). Invalid intervals and
+`OnCalendar` expressions are rejected up front.
+
+## Connecting a session to receive firings
+
+Loops only *deliver* into a session running the channel server. Register it in
+the project's `.mcp.json` (an example ships in the repo) or `~/.claude.json`:
+
+```json
+{ "mcpServers": { "everloop": { "command": "/home/stephan/.local/bin/everloop", "args": ["serve"] } } }
+```
+
+Channels are a research preview, so launch with the development flag:
+
+```bash
+claude --dangerously-load-development-channels server:everloop
+```
+
+On connect, the server drains any backlog first (the reconnect/replay path),
+then polls. Run one listening session per queue — two `serve` processes would
+race for the same spool.
+
+## Notes
+
+- Linger is enabled on citadel (`loginctl enable-linger` already done), so
+  timers fire even while logged out.
+- Intervals use `OnUnitActiveSec` (monotonic); calendars use `OnCalendar` with
+  `Persistent=true` (catches up a missed wall-clock fire at boot).
+- Local-only, no network listener: anything that can run `everloop send` as the
+  user can put text in front of Claude — same trust boundary as the shell.
+- `EVERLOOP_DATA_DIR` overrides state location; `EVERLOOP_POLL_SECONDS` the poll
+  interval.
+
+See `README.md` in the repo for architecture and delivery-semantics detail.
