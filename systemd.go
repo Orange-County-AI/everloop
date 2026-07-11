@@ -10,15 +10,30 @@ import (
 	"time"
 )
 
-const unitPrefix = "everloop-"
-
 func unitDir() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".config", "systemd", "user")
 }
 
-func timerName(loop string) string   { return unitPrefix + loop + ".timer" }
-func serviceName(loop string) string { return unitPrefix + loop + ".service" }
+// unitBase namespaces unit names by instance so two instances can each own a
+// loop of the same name without colliding: everloop-<instance>-<loop>.
+func unitBase() string {
+	if inst := instanceName(); inst != "" {
+		return "everloop-" + inst + "-"
+	}
+	return "everloop-"
+}
+
+func timerName(loop string) string   { return unitBase() + loop + ".timer" }
+func serviceName(loop string) string { return unitBase() + loop + ".service" }
+
+// instanceLabel is a human-readable "[instance] " prefix for unit descriptions.
+func instanceLabel() string {
+	if inst := instanceName(); inst != "" {
+		return "[" + inst + "] "
+	}
+	return ""
+}
 
 // systemctl runs `systemctl --user <args>`, ensuring XDG_RUNTIME_DIR is set
 // even when spawned from an environment that lacks it (e.g. an MCP subprocess).
@@ -98,23 +113,34 @@ func installUnits(l *Loop) error {
 		timerLines = fmt.Sprintf("OnActiveSec=%s\nOnUnitActiveSec=%s\nAccuracySec=1s", span, span)
 	}
 
+	// Bake the isolation env into the unit so the timer-fired `tick` resolves
+	// the same data dir this create used — without it, tick would read the
+	// default instance, fail to find the loop, and spool nothing.
+	var envLines string
+	if inst := instanceName(); inst != "" {
+		envLines += fmt.Sprintf("Environment=EVERLOOP_INSTANCE=%s\n", inst)
+	}
+	if d := os.Getenv("EVERLOOP_DATA_DIR"); d != "" {
+		envLines += fmt.Sprintf("Environment=EVERLOOP_DATA_DIR=%s\n", d)
+	}
+
 	service := fmt.Sprintf(`[Unit]
-Description=everloop tick: %s
+Description=everloop tick: %s%s
 
 [Service]
 Type=oneshot
-ExecStart=%s tick %s
-`, l.Name, bin, l.Name)
+%sExecStart=%s tick %s
+`, instanceLabel(), l.Name, envLines, bin, l.Name)
 
 	timer := fmt.Sprintf(`[Unit]
-Description=everloop timer: %s
+Description=everloop timer: %s%s
 
 [Timer]
 %s
 
 [Install]
 WantedBy=timers.target
-`, l.Name, timerLines)
+`, instanceLabel(), l.Name, timerLines)
 
 	if err := os.MkdirAll(unitDir(), 0o755); err != nil {
 		return err

@@ -39,12 +39,32 @@ type QueueMsg struct {
 
 var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)
 
+// instanceName isolates one everloop from another: several long-lived sessions
+// (each an MCP `serve`) must not share a spool or they would steal each other's
+// ticks. Set EVERLOOP_INSTANCE per session to give it its own data dir and
+// systemd unit namespace. Empty = the default (single-user) instance.
+func instanceName() string { return os.Getenv("EVERLOOP_INSTANCE") }
+
+// checkInstance validates the instance name, which becomes both a filesystem
+// path component and part of a systemd unit name.
+func checkInstance() error {
+	inst := instanceName()
+	if inst == "" || nameRe.MatchString(inst) {
+		return nil
+	}
+	return fmt.Errorf("invalid EVERLOOP_INSTANCE %q: must match %s", inst, nameRe)
+}
+
 func dataDir() string {
 	if d := os.Getenv("EVERLOOP_DATA_DIR"); d != "" {
 		return d
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "share", "everloop")
+	base := filepath.Join(home, ".local", "share", "everloop")
+	if inst := instanceName(); inst != "" {
+		return filepath.Join(base, inst)
+	}
+	return base
 }
 
 func loopsDir() string { return filepath.Join(dataDir(), "loops") }

@@ -92,5 +92,11 @@ race for the same spool.
   user can put text in front of Claude — same trust boundary as the shell.
 - `EVERLOOP_DATA_DIR` overrides state location; `EVERLOOP_POLL_SECONDS` the poll
   interval.
+- **Instances**: `EVERLOOP_INSTANCE=<name>` isolates a session's loops into
+  their own data dir (`~/.local/share/everloop/<name>/`) and unit namespace
+  (`everloop-<name>-<loop>`). Several orchestrators run concurrently this way —
+  the 52labs (`bot`), `jessica` (linear), and `clem` sessions each set their own
+  instance. Manage one from a shell with `EVERLOOP_INSTANCE=<name> everloop …`.
+  Unset = the default instance this skill drives.
 
 See `README.md` in the repo for architecture and delivery-semantics detail.

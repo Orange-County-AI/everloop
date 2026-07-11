@@ -34,6 +34,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, usage, version)
 		os.Exit(2)
 	}
+	if err := checkInstance(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
 	var err error
 	switch os.Args[1] {
 	case "serve":

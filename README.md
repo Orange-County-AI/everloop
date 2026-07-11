@@ -131,6 +131,37 @@ Reconcile the ledger and report anomalies.
 - **Security**: the channel is local-only — no network listener. Anything
   that can run `everloop send` as your user can put text in front of Claude,
   which is the same trust boundary as your shell.
-- **One session**: like all channels, run one listening session per queue.
-  Two concurrent `serve` processes would race for the same spool (each
-  message still goes to exactly one of them).
+- **One session per instance**: like all channels, run one listening session
+  per queue. Two concurrent `serve` processes sharing a spool would race for it
+  (each message still goes to exactly one of them). To run **several**
+  independent orchestrators at once, give each its own instance.
+
+## Multiple instances (`EVERLOOP_INSTANCE`)
+
+Several long-lived sessions (e.g. distinct Claude Code orchestrators) can each
+own their own loops by setting `EVERLOOP_INSTANCE=<name>` on the `serve`
+process. An instance gets:
+
+- its own data dir: `~/.local/share/everloop/<name>/`
+- its own systemd unit namespace: `everloop-<name>-<loop>.{timer,service}`
+
+The instance is baked into each generated `.service` (`Environment=`), so the
+timer-fired `tick` resolves the same data dir the `create` used. Loop names
+never collide across instances.
+
+Register it per session in `.mcp.json` (or `--mcp-config`):
+
+```json
+{ "mcpServers": { "everloop": {
+  "command": "/home/stephan/.local/bin/everloop", "args": ["serve"],
+  "env": { "EVERLOOP_INSTANCE": "clem" } } } }
+```
+
+To manage an instance's loops from a shell, set the same env:
+
+```bash
+EVERLOOP_INSTANCE=clem everloop list
+```
+
+An unset `EVERLOOP_INSTANCE` is the default instance (`~/.local/share/everloop/`,
+units `everloop-<loop>`), which is what the `/everloop` skill uses.
