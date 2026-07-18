@@ -1,18 +1,19 @@
 # everloop
 
-Persistent loops for Claude Code, backed by **systemd user timers**. No
-external service, no expiration.
+Persistent loops for Claude Code, backed by **OS user timers** — systemd on
+Linux, launchd on macOS. No external service, no expiration.
 
 Claude Code's built-in `/loop` (CronCreate) expires after 7 days. everloop
-moves the schedule out of the session and into systemd: each loop is a
-`.timer`/`.service` pair under `~/.config/systemd/user/`, so it survives
-session restarts and machine reboots, and — with linger enabled — fires even
-while you're logged out.
+moves the schedule out of the session and into the OS scheduler. On Linux each
+loop is a `.timer`/`.service` pair under `~/.config/systemd/user/`; on macOS
+it is a LaunchAgent plist under `~/Library/LaunchAgents/`. Either way it
+survives session restarts and machine reboots, and (on Linux, with linger
+enabled) fires even while you're logged out.
 
 ## How it works
 
 ```
-systemd timer ──▶ everloop tick NAME ──▶ ~/.local/share/everloop/queue/
+OS timer ──▶ everloop tick NAME ──▶ ~/.local/share/everloop/queue/
                                                        │
 Claude Code ◀── notifications/claude/channel ◀── everloop serve (MCP channel)
 ```
@@ -25,7 +26,7 @@ One static Go binary, three roles:
   event. It also exposes MCP tools (`create_loop`, `list_loops`,
   `update_loop`, `delete_loop`, `send_message`) so Claude can manage loops
   from inside the session.
-- **`everloop tick NAME`** — what each systemd timer executes. It spools one
+- **`everloop tick NAME`** — what each OS timer executes. It spools one
   firing to the queue. At most one pending tick per loop: repeat firings bump
   `coalesced_count` instead of piling up, so an outage never floods the
   session.
@@ -65,7 +66,7 @@ Channels are a research preview, so launch with the development flag:
 claude --dangerously-load-development-channels server:everloop
 ```
 
-For loops to fire while you're logged out, enable linger once:
+For loops to fire while you're logged out (Linux), enable linger once:
 
 ```bash
 loginctl enable-linger $USER
@@ -84,6 +85,7 @@ Or from any shell:
 everloop create reconcile --message "Reconcile the ledger and report anomalies." --every 1h
 
 # calendar loop (systemd OnCalendar syntax; missed fires run at next boot)
+# macOS supports a subset: hourly, daily, weekly, "*-*-* HH:MM", "Mon *-*-* HH:MM"
 everloop create standup --message "Draft the daily standup summary." --calendar "Mon..Fri 09:00"
 
 everloop list
@@ -118,13 +120,18 @@ Reconcile the ledger and report anomalies.
   (`EVERLOOP_POLL_SECONDS` to change), so end-to-end latency is a few
   seconds — but events only enter the conversation between turns, like any
   channel.
-- **Interval vs calendar**: `--every` uses `OnUnitActiveSec` (monotonic,
-  reschedules from activation); `--calendar` uses `OnCalendar` with
-  `Persistent=true` (wall-clock, a fire missed while the machine was off
-  runs at next boot).
+- **Interval vs calendar**: on Linux `--every` uses `OnUnitActiveSec`
+  (monotonic, reschedules from activation) and `--calendar` uses `OnCalendar`
+  with `Persistent=true` (wall-clock, a fire missed while the machine was off
+  runs at next boot). On macOS `--every` uses `StartInterval` and `--calendar`
+  maps a subset of OnCalendar syntax (`hourly`, `daily`, `weekly`,
+  `*-*-* HH:MM`, `Mon *-*-* HH:MM`) to `StartCalendarInterval`; launchd has no
+  missed-fire catch-up and exposes no next-fire time in `list`.
 - **State**: loop definitions and the spool live in
-  `~/.local/share/everloop/` (`EVERLOOP_DATA_DIR` to override). Units are
-  `~/.config/systemd/user/everloop-<name>.{timer,service}`.
+  `~/.local/share/everloop/` (`EVERLOOP_DATA_DIR` to override). Timers are
+  `~/.config/systemd/user/everloop-<name>.{timer,service}` on Linux,
+  `~/Library/LaunchAgents/com.52labs.everloop.<name>.plist` on macOS (tick
+  output logs to `~/Library/Logs/everloop/<name>.log`).
 - **Concurrency**: spool mutations are serialized with a `flock` on
   `queue.lock`; delivery claims rename the file first, so a tick landing
   mid-claim starts a fresh entry and no coalesce increment is lost.
@@ -143,11 +150,12 @@ own their own loops by setting `EVERLOOP_INSTANCE=<name>` on the `serve`
 process. An instance gets:
 
 - its own data dir: `~/.local/share/everloop/<name>/`
-- its own systemd unit namespace: `everloop-<name>-<loop>.{timer,service}`
+- its own timer namespace: `everloop-<name>-<loop>.{timer,service}` on Linux,
+  `com.52labs.everloop.<name>.<loop>.plist` on macOS
 
-The instance is baked into each generated `.service` (`Environment=`), so the
-timer-fired `tick` resolves the same data dir the `create` used. Loop names
-never collide across instances.
+The instance is baked into each generated timer (`Environment=` /
+`EnvironmentVariables`), so the timer-fired `tick` resolves the same data dir
+the `create` used. Loop names never collide across instances.
 
 Register it per session in `.mcp.json` (or `--mcp-config`):
 

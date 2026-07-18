@@ -13,7 +13,10 @@ description: >
 
 everloop replaces the built-in `/loop` (whose CronCreate schedule expires after
 ~7 days) with **systemd user timers**, so a recurring instruction fires forever
-— across session restarts and reboots — with no external service.
+— across session restarts and reboots — with no external service. (On macOS the
+same binary uses launchd agents under `~/Library/LaunchAgents/` instead; the
+CLI and tools are identical, but calendar expressions are limited to a subset —
+`hourly`, `daily`, `weekly`, `*-*-* HH:MM`, `Mon *-*-* HH:MM`.)
 
 - **Repo & source:** `~/projects/52labs/everloop`
 - **Binary:** `~/.local/bin/everloop` (rebuild with `cd ~/projects/52labs/everloop && go build -o ~/.local/bin/everloop .`)
@@ -27,7 +30,7 @@ One Go binary, three roles:
   Declares `claude/channel`, drains the spool every ~2s, and pushes each firing
   into the session as `<channel source="everloop" ...>`. Also exposes the loop
   management tools below.
-- `everloop tick <name>` — what each systemd timer runs; spools one firing.
+- `everloop tick <name>` — what each OS timer runs; spools one firing.
   Coalescing: at most one pending tick per loop, so an outage never floods the
   session (repeat fires bump `coalesced_count`).
 - CLI — `create` / `list` / `update` / `delete` / `send`.
