@@ -1,8 +1,9 @@
-// everloop: persistent loops for Claude Code, backed by systemd user timers.
+// everloop: persistent loops for Claude Code, backed by OS user timers
+// (systemd on Linux, launchd on macOS).
 //
 // One binary, three roles:
 //   - `everloop serve`      the MCP channel server Claude Code spawns (stdio)
-//   - `everloop tick NAME`  what each systemd timer executes: spool one firing
+//   - `everloop tick NAME`  what each OS timer executes: spool one firing
 //   - CLI loop management   create/list/update/delete/send, mirroring the MCP tools
 package main
 
@@ -14,7 +15,8 @@ import (
 
 const version = "0.1.0"
 
-const usage = `everloop %s - persistent loops for Claude Code, backed by systemd user timers
+const usage = `everloop %s - persistent loops for Claude Code, backed by OS timers
+(systemd user timers on Linux, launchd agents on macOS)
 
 Usage:
   everloop serve                                 run as MCP channel server (stdio)
@@ -23,10 +25,13 @@ Usage:
   everloop update NAME [--message M] [--every D] [--calendar C] [--enable|--disable]
   everloop delete NAME
   everloop send MESSAGE                          spool an ad-hoc message to the session
-  everloop tick NAME                             (called by systemd) spool one loop firing
+  everloop tick NAME                             (called by the OS timer) spool one loop firing
 
-Intervals: 90s, 5m, 1h30m, 2d (min 10s). Calendar: systemd OnCalendar syntax.
-State: ~/.local/share/everloop  Units: ~/.config/systemd/user/everloop-*.timer
+Intervals: 90s, 5m, 1h30m, 2d (min 10s). Calendar: systemd OnCalendar syntax
+(macOS supports a subset: hourly, daily, weekly, "*-*-* HH:MM", "Mon *-*-* HH:MM").
+State: ~/.local/share/everloop
+Timers: ~/.config/systemd/user/everloop-*.timer (Linux)
+        ~/Library/LaunchAgents/com.52labs.everloop.*.plist (macOS)
 `
 
 func main() {
