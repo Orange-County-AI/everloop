@@ -72,7 +72,15 @@ func serve() error {
 		return err
 	}
 	out := &stdoutWriter{enc: json.NewEncoder(os.Stdout)}
-	startPolling := sync.OnceFunc(func() { go drainLoop(out) })
+	dlv, err := newSink("everloop", out)
+	if err != nil {
+		return err
+	}
+	startPolling := sync.OnceFunc(func() {
+		if dlv != nil { // nil = tools-only (CHANNEL_SINK=none): a pump owns delivery
+			go drainLoop(dlv)
+		}
+	})
 
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -104,6 +112,7 @@ func serve() error {
 				"serverInfo":   map[string]any{"name": "everloop", "version": version},
 				"instructions": serverInstructions,
 			})
+			startPolling() // don't rely on the client sending notifications/initialized
 		case "notifications/initialized":
 			startPolling()
 		case "ping":
@@ -121,10 +130,12 @@ func serve() error {
 	return scanner.Err()
 }
 
-// drainLoop polls the spool and pushes each claimed message into the session.
-// Delivery order: claim -> notify -> ack, so a crash mid-delivery redelivers
-// (at-least-once); the message ID doubles as an idempotency key.
-func drainLoop(out *stdoutWriter) {
+// drainLoop polls the spool and delivers each claimed message into the
+// session via the configured sink (CHANNEL_SINK). Delivery order: claim ->
+// deliver -> ack; an unacked (claimed) message is re-claimed on the next
+// poll, so a crash or a failing sink redelivers (at-least-once) and the
+// message ID doubles as an idempotency key.
+func drainLoop(dlv sink) {
 	ticker := time.NewTicker(pollInterval())
 	defer ticker.Stop()
 	for {
@@ -147,10 +158,12 @@ func drainLoop(out *stdoutWriter) {
 			for k, v := range c.msg.Meta {
 				meta[k] = v
 			}
-			out.notify("notifications/claude/channel", map[string]any{
-				"content": c.msg.Content,
-				"meta":    meta,
-			})
+			if err := dlv.deliver(c.msg.Content, meta); err != nil {
+				// Leave claimed: retried next poll. Break to preserve order
+				// and avoid hammering a down sink with the rest of the batch.
+				fmt.Fprintf(os.Stderr, "everloop: deliver %s failed (retrying next poll): %v\n", c.msg.ID, err)
+				break
+			}
 			c.ack()
 		}
 		<-ticker.C

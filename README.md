@@ -114,6 +114,59 @@ Reconcile the ledger and report anomalies.
 - `kind="message"` — an ad-hoc message from `everloop send` or the
   `send_message` tool.
 
+## Other harnesses (`CHANNEL_SINK`)
+
+Everything above the last hop — the OS timers, the spool, claim → ack,
+coalescing — is harness-agnostic; only the default MCP-channel push is
+Claude-Code-specific. The last hop is a pluggable **sink**
+(`CHANNEL_SINK=claude|opencode|hermes`, default claude), shared with
+[tincan](../tincan). Events always arrive wrapped in the same
+`<channel source="everloop" ...>` envelope, so agent instructions are
+portable across harnesses, and delivery through any sink keeps the
+at-least-once contract: a failed delivery leaves the message claimed and it
+is retried next poll, in order.
+
+Mount `everloop serve` as an MCP server in the harness with the sink envs
+set — one process then does both directions (the harness gets the
+`create_loop` / `send_message` / etc. tools over stdio, and the drain loop
+injects inbound events over HTTP). `CHANNEL_SINK=none` gives a tools-only
+serve (no draining) for deployments where a separate process owns delivery.
+
+**OpenCode** — targets a live [`opencode serve`](https://opencode.ai/docs/server/)
+(`OPENCODE_URL`, default `http://127.0.0.1:4096`); each event becomes a user
+turn via `POST /session/{id}/prompt_async`. The session is resolved by title
+(`OPENCODE_SESSION_TITLE`, scoped by `OPENCODE_DIRECTORY`) — found or created
+on first delivery, re-resolved if it vanishes — or pinned with
+`OPENCODE_SESSION_ID`. Basic auth follows opencode's own
+`OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD`.
+
+```jsonc
+// opencode.json — one process: tools + injection
+{
+  "mcp": {
+    "everloop": {
+      "type": "local",
+      "command": ["everloop", "serve"],
+      "environment": {
+        "EVERLOOP_INSTANCE": "clem",
+        "CHANNEL_SINK": "opencode",
+        "OPENCODE_SESSION_TITLE": "clem"
+      }
+    }
+  }
+}
+```
+
+**Hermes** — targets a [hermes gateway webhook route](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/webhooks)
+(`HERMES_WEBHOOK_URL`, e.g. `http://127.0.0.1:8644/webhooks/everloop`), one
+POST per event, signed with the route's Generic V2 secret
+(`HERMES_WEBHOOK_SECRET`; HMAC-SHA256 of `<timestamp>.<body>`) and
+deduplicated by an `X-Request-ID` of `everloop-<event_id>` — hermes drops
+repeats for 1h, which pairs with the spool's at-least-once redelivery. Each
+event spawns a run; hermes has no persistent session to inject into. The
+payload is `{"body": "<channel ...>...</channel>", "meta": {...}}`, so the
+route's prompt template is just `{body}`.
+
 ## Notes & semantics
 
 - **Latency**: timer accuracy is 1s and the spool poll is 2s
