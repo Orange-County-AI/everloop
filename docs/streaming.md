@@ -245,6 +245,20 @@ forever) and should be rejected rather than silently ignored when mode=stream.
 Phase 2's own knobs — `RestartSec`, flush debounce, rate ceiling — are new
 fields, not overloads of existing ones.
 
+## The portable backend needs its own answer here
+
+This document predates the portable backend (`everloop scheduler`), and the
+whole unit shape above assumes something that supervises processes for us. The
+portable backend has no such thing: it schedules ticks, it does not supervise
+long-lived children. A stream loop there would mean the daemon owning the
+process — spawn, read stdout, restart with backoff, report the gap — which is
+the same policy as above, implemented in Go rather than declared in a unit file.
+Not hard, but it is a third implementation of restart semantics and it should be
+designed once the other two exist rather than guessed at now.
+
+The parts that do carry over unchanged: the spool, the accumulation primitive,
+the damping, and the "a restart is a reportable gap" rule.
+
 ## Open questions
 
 Honest list of what this design does not settle:

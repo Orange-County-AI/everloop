@@ -1,33 +1,42 @@
 # everloop
 
-Persistent loops for Claude Code, backed by **OS user timers** — systemd on
-Linux, launchd on macOS. No external service, no expiration.
+Persistent loops for Claude Code, scheduled **outside the session** — by
+systemd user timers, launchd agents, or everloop's own scheduler daemon where
+there is no init system to borrow (containers). No external service, no
+expiration.
 
 Claude Code's built-in `/loop` (CronCreate) expires after 7 days. everloop
-moves the schedule out of the session and into the OS scheduler. On Linux each
-loop is a `.timer`/`.service` pair under `~/.config/systemd/user/`; on macOS
-it is a LaunchAgent plist under `~/Library/LaunchAgents/`. Either way it
-survives session restarts and machine reboots, and (on Linux, with linger
-enabled) fires even while you're logged out.
+moves the schedule out of the session and into something that outlives it. On
+Linux each loop is normally a `.timer`/`.service` pair under
+`~/.config/systemd/user/`; on macOS a LaunchAgent plist under
+`~/Library/LaunchAgents/`; in a container with no systemd, a row of state that
+`everloop scheduler` acts on. Either way it survives session restarts and
+machine reboots, and (on Linux, with linger enabled) fires even while you're
+logged out.
 
 ## How it works
 
 ```
-OS timer ──▶ everloop tick NAME ──▶ ~/.local/share/everloop/queue/
+timer / scheduler ──▶ everloop tick NAME ──▶ ~/.local/share/everloop/queue/
                                                        │
 Claude Code ◀── notifications/claude/channel ◀── everloop serve (MCP channel)
 ```
 
-One static Go binary, three roles:
+One static Go binary, four roles:
 
 - **`everloop serve`** — the MCP channel server Claude Code spawns over stdio.
   It declares the `claude/channel` capability, polls the spool every 2s, and
   pushes each message into the session as a `<channel source="everloop" ...>`
   event. It also exposes MCP tools (`create_loop`, `list_loops`,
   `update_loop`, `delete_loop`, `send_message`) so Claude can manage loops
-  from inside the session.
-- **`everloop tick NAME`** — what each OS timer executes. It spools one
-  firing to the queue. At most one pending tick per loop: repeat firings bump
+  from inside the session. It never schedules anything — see
+  [Backends](#backends-systemd-launchd-portable).
+- **`everloop scheduler`** — the supervised daemon that fires loops when the
+  portable backend is live. Not needed when systemd or launchd is doing the
+  scheduling.
+- **`everloop tick NAME`** — one firing, spooled to the queue: what a systemd
+  timer or launchd agent executes (the scheduler daemon does the same work
+  in-process). At most one pending tick per loop: repeat firings bump
   `coalesced_count` instead of piling up, so an outage never floods the
   session. If the loop has a `--command`, the tick runs it first and spools
   **only if it produced output** (see [Command loops](#command-loops-a-watch-not-a-heartbeat)).
@@ -67,11 +76,119 @@ Channels are a research preview, so launch with the development flag:
 claude --dangerously-load-development-channels server:everloop
 ```
 
-For loops to fire while you're logged out (Linux), enable linger once:
+For loops to fire while you're logged out (Linux, systemd backend), enable
+linger once:
 
 ```bash
 loginctl enable-linger $USER
 ```
+
+## Backends: systemd, launchd, portable
+
+everloop picks its scheduler at **runtime**, not by build tag — the same Linux
+binary runs on a box with a systemd user manager and inside a container that
+has none.
+
+| backend | where the schedule lives | picked when |
+| --- | --- | --- |
+| `systemd` | `~/.config/systemd/user/everloop-<name>.{timer,service}` | Linux, and `systemctl --user` actually works |
+| `launchd` | `~/Library/LaunchAgents/com.52labs.everloop.<name>.plist` | macOS |
+| `portable` | `schedule/<name>.json` + the `everloop scheduler` daemon | nothing usable to borrow |
+
+`EVERLOOP_BACKEND=auto|systemd|launchd|portable` overrides the choice (`auto`
+is the default). Forcing a backend that cannot work here is an error, never a
+silent downgrade. Every status line names the backend holding the loop, because
+"my loop never fired" starts with "which scheduler was supposed to fire it":
+
+```
+$ everloop list
+- reconcile: every 1h | enabled=true | timer=systemd: active (next: Mon 2026-07-27 08:00:00 UTC)
+- sweep: every 10m | enabled=true | timer=portable: next Mon 2026-07-27 07:20:00 UTC
+```
+
+### Running in a container (no systemd)
+
+Our agent workspace pods are stateful Linux containers with sshd and
+passwordless sudo, `hostUsers: false`, `/sys/fs/cgroup` mounted read-only, and
+no systemd in the image at all — making the cgroup tree writable would hand back
+the privileges the sandbox exists to remove. Kubernetes CronJobs are not the
+alternative either: loops are created at runtime by the agent, and the pods
+deliberately run with `automountServiceAccountToken: false`, so there is no API
+to create them with.
+
+So run everloop's own scheduler:
+
+```bash
+everloop scheduler
+```
+
+It is built to be **supervised, not self-supervising**: no daemonising, no
+forking, logs to stdout, exits non-zero on anything fatal, and a flock makes a
+second copy refuse to start rather than double-fire every loop. `SIGTERM` stops
+it cleanly (in-flight command loops get 10s of grace), `SIGHUP` just brings the
+next scan forward. In the workspace image PID 1 is a small supervisor running
+sshd and this side by side; anything that restarts a process and captures its
+stdout works.
+
+```
+2026-07-27T07:14:29Z everloop[scheduler]: started: pid 1, instance "clem", data /root/.local/share/everloop/clem, scan 1s, 4 loop(s)
+2026-07-27T07:14:33Z everloop[scheduler]: fire: loop "veto-merge-sweep" (every 10m)
+2026-07-27T07:16:04Z everloop[scheduler]: catch-up: loop "inbox-sweep" missed 7 fires since 2026-07-27T07:15:02Z — firing once
+```
+
+Loops are created by a *different* process than the one that fires them (an MCP
+`serve`, or a shell), so there is no reload RPC and nothing to signal: the
+daemon re-reads the store every scan (1s, `EVERLOOP_SCAN_SECONDS`) and treats it
+as the source of truth. A loop created in a session is picked up within a
+second, and `everloop scheduler` can be restarted at any time without losing
+one.
+
+**Scheduling deliberately does not live in `everloop serve`.** That process is a
+child of the agent's Claude Code session, so loops scheduled there would die
+with the session — exactly the `/loop` and `CronCreate` failure mode everloop
+was built to fix. `serve` warns on stderr if it starts with the portable backend
+live and nothing scheduling.
+
+### What the portable backend has to keep that systemd kept for us
+
+- **Fire history.** `schedule/<loop>.json` holds the next and last fire, written
+  with the contents fsynced before the rename and the directory fsynced after —
+  it is the only record of when a loop last ran, so a power cut must not lose it.
+- **Catch-up.** systemd's `Persistent=true` runs a fire missed while the machine
+  was off exactly once at next boot. The daemon reproduces that without a
+  special case: a loop whose next fire is in the past is simply *due*, so it
+  fires **once** — not once per missed interval — and resumes its normal
+  cadence. That is also what the session is told to expect, since
+  `coalesced_count` means catch up once rather than repeat the work N times.
+- **At-least-once, not at-most-once.** The schedule advances *after* the tick is
+  spooled, never before. A crash in between costs a repeat, which the spool
+  coalesces away; advancing first would turn the same crash into a silently
+  skipped sweep, and a loop that quietly stops is the failure everloop exists to
+  prevent.
+- **Overrun handling.** A loop still running from its last fire is skipped, not
+  started twice — the same thing systemd does with a oneshot service that has
+  not finished.
+- **OnCalendar parsing.** `systemd-analyze calendar` is not in the image either,
+  so expressions are parsed in-process (below).
+
+### Calendar expressions
+
+The systemd backend hands `--calendar` to systemd verbatim. The launchd and
+portable backends parse it themselves, and accept a subset:
+
+| form | example |
+| --- | --- |
+| shorthands | `minutely`, `hourly`, `daily`, `weekly`, `monthly`, `yearly` |
+| time of day | `09:00`, `17:30:15` |
+| date + time | `*-*-* 09:00:00`, `*-*-01 00:00:00`, `2026-12-25 06:30:00` |
+| weekday + time | `Mon..Fri 09:00`, `Sat,Sun 12:00`, `Fri *-*-* 18:00:00` |
+| lists, ranges, steps in any component | `*:0/15`, `*:0,30`, `9..17:00` |
+
+Everything else — timezone suffixes, `~` (last day of month), `@`-timestamps,
+and cron syntax, which is a different language entirely — is **rejected at
+create time**, with an error naming what is supported. That is deliberate: a
+mis-scheduled loop still looks alive, so nobody investigates it. An expression
+that parses but can never occur (`*-02-30`) is refused for the same reason.
 
 ## Usage
 
@@ -85,8 +202,9 @@ Or from any shell:
 # interval loop (90s, 5m, 1h30m, 2d — min 10s)
 everloop create reconcile --message "Reconcile the ledger and report anomalies." --every 1h
 
-# calendar loop (systemd OnCalendar syntax; missed fires run at next boot)
-# macOS supports a subset: hourly, daily, weekly, "*-*-* HH:MM", "Mon *-*-* HH:MM"
+# calendar loop (OnCalendar syntax; a fire missed while the machine was down
+# runs once when it comes back — see "Calendar expressions" for the subset the
+# launchd and portable backends accept)
 everloop create standup --message "Draft the daily standup summary." --calendar "Mon..Fri 09:00"
 
 # command loop (a watch: silent unless the command prints something)
@@ -191,10 +309,11 @@ Command loops **poll**. Sources that push instead — `tail -f`, `inotifywait -m
 a WebSocket — need a supervised long-lived process rather than a timer. That is
 designed but deliberately not built: see [docs/streaming.md](docs/streaming.md).
 
-### The command runs under systemd, not your shell
+### The command runs under the scheduler, not your shell
 
-This has bitten us twice. The command is executed by the **systemd user
-manager** (launchd on macOS), not a login shell:
+This has bitten us twice. The command is executed by whatever is scheduling —
+the **systemd user manager**, launchd, or the `everloop scheduler` daemon — and
+never by a login shell:
 
 - **`~/.profile`, `~/.bashrc` and `~/.bash_profile` are NOT sourced.** Anything
   they export — `fnox activate`, mise activation, `direnv`, a project `venv` —
@@ -206,6 +325,9 @@ manager** (launchd on macOS), not a login shell:
   drop-in they will not.
 - Secrets that live in your interactive environment are not there either. Have
   the script fetch them itself (`fnox get KEY`) rather than assuming `$KEY`.
+- Under the portable backend the command inherits the **daemon's** environment,
+  which is whatever the supervisor gave PID 1 — usually smaller still, and
+  nothing like an SSH session's.
 
 A command that works pasted into a terminal can still fail under the timer, and
 before this feature it failed *invisibly* — a script died with
@@ -297,20 +419,23 @@ route's prompt template is just `{body}`.
 
 ## Notes & semantics
 
-- **Latency**: timer accuracy is 1s and the spool poll is 2s
-  (`EVERLOOP_POLL_SECONDS` to change), so end-to-end latency is a few
-  seconds — but events only enter the conversation between turns, like any
-  channel.
+- **Latency**: timer accuracy is 1s (the portable scheduler scans every 1s,
+  `EVERLOOP_SCAN_SECONDS`) and the spool poll is 2s (`EVERLOOP_POLL_SECONDS`),
+  so end-to-end latency is a few seconds — but events only enter the
+  conversation between turns, like any channel.
 - **Interval vs calendar**: on Linux `--every` uses `OnUnitActiveSec`
   (monotonic, reschedules from activation) and `--calendar` uses `OnCalendar`
   with `Persistent=true` (wall-clock, a fire missed while the machine was off
   runs at next boot). On macOS `--every` uses `StartInterval` and `--calendar`
-  maps a subset of OnCalendar syntax (`hourly`, `daily`, `weekly`,
-  `*-*-* HH:MM`, `Mon *-*-* HH:MM`) to `StartCalendarInterval`; launchd has no
-  missed-fire catch-up and exposes no next-fire time in `list`.
-- **State**: loop definitions, the spool, and per-loop command-failure damping
-  memory (`state/<loop>.json`) live in
-  `~/.local/share/everloop/` (`EVERLOOP_DATA_DIR` to override). Timers are
+  maps a subset of OnCalendar syntax to `StartCalendarInterval`; launchd has no
+  missed-fire catch-up and exposes no next-fire time in `list`. The portable
+  backend anchors an interval to the *scheduled* fire (so a slow command does
+  not make the loop drift) and catches up a missed window exactly once, for
+  both schedule kinds.
+- **State**: loop definitions, the spool, per-loop command-failure damping
+  memory (`state/<loop>.json`) and — under the portable backend — fire history
+  (`schedule/<loop>.json`) live in `~/.local/share/everloop/`
+  (`EVERLOOP_DATA_DIR` to override). Timers are
   `~/.config/systemd/user/everloop-<name>.{timer,service}` on Linux,
   `~/Library/LaunchAgents/com.52labs.everloop.<name>.plist` on macOS (tick
   output logs to `~/Library/Logs/everloop/<name>.log`).
@@ -320,23 +445,25 @@ route's prompt template is just `{body}`.
   command output) is lost. A loop's command runs *outside* that lock — it may
   take up to its full timeout, and holding the flock that long would stall the
   drain loop and every other loop's tick.
-- **Command loops on macOS**: the semantics above are identical (silence,
-  accumulation, damping, timeout), but two mechanics differ. systemd units get
+- **Command loops off systemd**: the semantics above are identical (silence,
+  accumulation, damping, timeout), but one mechanic differs. systemd units get
   `TimeoutStartSec = timeout + 30s` so the tick outlives its own deadline and
-  can spool the failure report; launchd has no per-invocation runtime cap, so
-  everloop's in-process timeout is the only bound there — a hung command is
-  still killed, it just isn't double-covered. And launchd has no equivalent of
-  the `10-path.conf` drop-in: its PATH defaults to
-  `/usr/bin:/bin:/usr/sbin:/sbin`, so absolute paths matter more, not less.
-  Failure damping state lives in `~/.local/share/everloop/state/<loop>.json`
-  on both platforms.
+  can spool the failure report; launchd and the portable scheduler have no
+  per-invocation runtime cap, so everloop's in-process timeout is the only
+  bound there — a hung command is still killed, it just isn't double-covered.
+  launchd also has no equivalent of the `10-path.conf` drop-in: its PATH
+  defaults to `/usr/bin:/bin:/usr/sbin:/sbin`, so absolute paths matter more,
+  not less. Failure damping state lives in
+  `~/.local/share/everloop/state/<loop>.json` everywhere.
 - **Security**: the channel is local-only — no network listener. Anything
   that can run `everloop send` as your user can put text in front of Claude,
   which is the same trust boundary as your shell.
 - **One session per instance**: like all channels, run one listening session
   per queue. Two concurrent `serve` processes sharing a spool would race for it
   (each message still goes to exactly one of them). To run **several**
-  independent orchestrators at once, give each its own instance.
+  independent orchestrators at once, give each its own instance. Under the
+  portable backend the same goes for the daemon — one `everloop scheduler` per
+  data dir, which the lock enforces rather than trusts.
 
 ## Multiple instances (`EVERLOOP_INSTANCE`)
 
@@ -346,7 +473,10 @@ process. An instance gets:
 
 - its own data dir: `~/.local/share/everloop/<name>/`
 - its own timer namespace: `everloop-<name>-<loop>.{timer,service}` on Linux,
-  `com.52labs.everloop.<name>.<loop>.plist` on macOS
+  `com.52labs.everloop.<name>.<loop>.plist` on macOS. Under the portable
+  backend the data dir *is* the namespace — one `everloop scheduler` per
+  instance, each pointed at its own `EVERLOOP_INSTANCE` (or
+  `EVERLOOP_DATA_DIR`).
 
 The instance is baked into each generated timer (`Environment=` /
 `EnvironmentVariables`), so the timer-fired `tick` resolves the same data dir
