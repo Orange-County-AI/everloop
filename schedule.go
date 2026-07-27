@@ -52,9 +52,9 @@ func parseEvery(s string) (time.Duration, error) {
 // --- high-level loop operations (shared by CLI and MCP tools) ----------------
 
 // loopSpec is the mutable surface of a Loop, shared by create and update so
-// both paths validate identically. A nil field means "leave alone"; the CLI
-// only fills in flags the user actually passed (see setFlags) and the MCP tools
-// get the same distinction free from JSON pointers.
+// both paths validate identically. A nil field means "leave alone": the CLI
+// fills in only the flags the user actually passed (see loopFlags) and the MCP
+// tools get the same distinction free from JSON pointers.
 type loopSpec struct {
 	Message  *string
 	Command  *string

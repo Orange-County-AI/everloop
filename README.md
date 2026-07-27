@@ -308,7 +308,8 @@ route's prompt template is just `{body}`.
   maps a subset of OnCalendar syntax (`hourly`, `daily`, `weekly`,
   `*-*-* HH:MM`, `Mon *-*-* HH:MM`) to `StartCalendarInterval`; launchd has no
   missed-fire catch-up and exposes no next-fire time in `list`.
-- **State**: loop definitions and the spool live in
+- **State**: loop definitions, the spool, and per-loop command-failure damping
+  memory (`state/<loop>.json`) live in
   `~/.local/share/everloop/` (`EVERLOOP_DATA_DIR` to override). Timers are
   `~/.config/systemd/user/everloop-<name>.{timer,service}` on Linux,
   `~/Library/LaunchAgents/com.52labs.everloop.<name>.plist` on macOS (tick

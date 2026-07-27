@@ -26,10 +26,10 @@ import (
 type Loop struct {
 	Name      string    `json:"name"`
 	Message   string    `json:"message"`
-	Command   string    `json:"command,omitempty"` // watch: run this each firing, spool only on output
-	Timeout   string    `json:"timeout,omitempty"` // max command runtime, default 60s
-	Every     string    `json:"every,omitempty"`   // interval, e.g. "1h30m", "2d"
-	Calendar  string    `json:"calendar,omitempty"`
+	Command   string    `json:"command,omitempty"`  // watch: run this each firing, spool only on output
+	Timeout   string    `json:"timeout,omitempty"`  // max command runtime, default 60s
+	Every     string    `json:"every,omitempty"`    // interval, e.g. "1h30m", "2d"
+	Calendar  string    `json:"calendar,omitempty"` // systemd OnCalendar expression
 	Enabled   bool      `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
