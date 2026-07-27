@@ -65,15 +65,22 @@ type runOutput struct {
 }
 
 // status summarises an event for the delivery meta, so an agent can tell a
-// failure report from a watch hit without parsing the body.
+// failure report from a watch hit without parsing the body. It reports the
+// LAST run that changed health, not any run that ever failed: an event
+// accumulated across an outage can hold failures followed by a recovery, and
+// labelling that whole event "error" would describe a watch that is now fine
+// as broken.
 func (m QueueMsg) status() string {
-	s := ""
+	last := ""
 	for _, r := range m.Runs {
-		if r.Status == "error" || r.Status == "timeout" {
-			s = r.Status
+		if r.Status != "" {
+			last = r.Status
 		}
 	}
-	return s
+	if last == "recovered" {
+		return ""
+	}
+	return last
 }
 
 var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)
