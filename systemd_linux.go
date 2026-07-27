@@ -8,7 +8,38 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 )
+
+// systemd backend: a .timer/.service pair per loop under
+// ~/.config/systemd/user. The native backend on Linux — when there is a systemd
+// user manager to talk to at all (see nativeUnusable).
+type systemdBackend struct{}
+
+func (systemdBackend) name() string { return "systemd" }
+
+func nativeBackend() backend { return systemdBackend{} }
+
+// nativeUnusable reports why systemd cannot schedule here, or "" when it can.
+//
+// Both failure modes are real and neither is exotic. Our workspace containers
+// have no systemctl in the image at all; a box can also have the binary but no
+// reachable user manager (no session bus, PID 1 is not systemd), where every
+// systemctl call fails with "Failed to connect to bus". `show` is the cheapest
+// call that proves the whole path works: it needs the binary, the environment
+// and a live user manager on the other end.
+var nativeUnusable = sync.OnceValue(func() string {
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		return "systemctl not found in PATH"
+	}
+	if out, err := systemctl("show", "--property=Version"); err != nil {
+		if line, _, ok := strings.Cut(strings.TrimSpace(out), "\n"); ok || line != "" {
+			return strings.TrimSpace(line)
+		}
+		return err.Error()
+	}
+	return ""
+})
 
 func unitDir() string {
 	home, _ := os.UserHomeDir()
@@ -50,7 +81,7 @@ func systemctl(args ...string) (string, error) {
 	return string(out), nil
 }
 
-func validateCalendar(expr string) error {
+func (systemdBackend) validateCalendar(expr string) error {
 	cmd := exec.Command("systemd-analyze", "calendar", expr)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -61,7 +92,7 @@ func validateCalendar(expr string) error {
 
 // installUnits writes the .timer/.service pair for a loop and reloads systemd.
 // The timer runs `everloop tick <name>`, which spools a message to the queue.
-func installUnits(l *Loop) error {
+func (systemdBackend) installUnits(l *Loop) error {
 	bin, err := os.Executable()
 	if err != nil {
 		return err
@@ -150,7 +181,7 @@ WantedBy=timers.target
 	return nil
 }
 
-func removeUnits(name string) error {
+func (systemdBackend) removeUnits(name string) error {
 	systemctl("disable", "--now", timerName(name))
 	os.Remove(filepath.Join(unitDir(), timerName(name)))
 	os.Remove(filepath.Join(unitDir(), serviceName(name)))
@@ -158,11 +189,13 @@ func removeUnits(name string) error {
 	return err
 }
 
-// timerStatus returns e.g. "active (next: Wed 2026-07-09 01:00:00)".
-func timerStatus(name string) string {
+// timerStatus returns e.g. "systemd: active (next: Wed 2026-07-09 01:00:00)".
+// The backend prefix is on every line so a list read in a bug report says which
+// scheduler was meant to be holding the loop.
+func (systemdBackend) timerStatus(name string) string {
 	out, err := systemctl("show", timerName(name), "--property=ActiveState,NextElapseUSecRealtime")
 	if err != nil {
-		return "unknown"
+		return "systemd: unknown"
 	}
 	state, next := "unknown", ""
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
@@ -174,7 +207,7 @@ func timerStatus(name string) string {
 		}
 	}
 	if next != "" && state == "active" {
-		return fmt.Sprintf("%s (next: %s)", state, next)
+		return fmt.Sprintf("systemd: %s (next: %s)", state, next)
 	}
-	return state
+	return "systemd: " + state
 }

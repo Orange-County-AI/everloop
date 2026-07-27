@@ -73,6 +73,7 @@ func serve() error {
 	if err := ensureDirs(); err != nil {
 		return err
 	}
+	warnIfNoScheduler()
 	out := &stdoutWriter{enc: json.NewEncoder(os.Stdout)}
 	dlv, err := newSink("everloop", out)
 	if err != nil {
