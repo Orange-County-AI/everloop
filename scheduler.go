@@ -181,8 +181,8 @@ func (s *scheduler) pass(now time.Time) {
 		if !l.Enabled {
 			continue
 		}
-		st, armed := loadSchedState(l.Name)
-		if !armed {
+		st, ok := loadSchedState(l.Name)
+		if !ok {
 			s.adopt(l, now)
 			continue
 		}
