@@ -187,6 +187,10 @@ meta so an agent can tell a diagnostic from a watch hit without parsing the
 body. stderr is included because that is where a broken environment announces
 itself — which brings us to:
 
+Command loops **poll**. Sources that push instead — `tail -f`, `inotifywait -m`,
+a WebSocket — need a supervised long-lived process rather than a timer. That is
+designed but deliberately not built: see [docs/streaming.md](docs/streaming.md).
+
 ### The command runs under systemd, not your shell
 
 This has bitten us twice. The command is executed by the **systemd user
