@@ -410,6 +410,38 @@ func TestDisabledCommandLoopDoesNotRun(t *testing.T) {
 	}
 }
 
+// The MCP tools rely on encoding/json promoting an embedded unexported
+// struct's exported fields, and on absent keys staying nil. If either broke,
+// update_loop would start wiping fields the caller never mentioned.
+func TestToolArgsBindToLoopSpec(t *testing.T) {
+	var a toolLoopArgs
+	if err := json.Unmarshal([]byte(`{"name":"covers","message":"m","command":"c","timeout":"30s","every":"5m","enabled":false}`), &a); err != nil {
+		t.Fatal(err)
+	}
+	if a.Name != "covers" || a.Message == nil || *a.Message != "m" ||
+		a.Command == nil || *a.Command != "c" || a.Timeout == nil || *a.Timeout != "30s" ||
+		a.Every == nil || *a.Every != "5m" || a.Enabled == nil || *a.Enabled != false {
+		t.Fatalf("promoted fields did not bind: %+v", a)
+	}
+
+	var partial toolLoopArgs
+	if err := json.Unmarshal([]byte(`{"name":"covers","every":"5m"}`), &partial); err != nil {
+		t.Fatal(err)
+	}
+	if partial.Message != nil || partial.Command != nil || partial.Enabled != nil {
+		t.Fatal("absent keys must stay nil so update leaves them alone")
+	}
+
+	// An explicit empty command is a clear, distinct from an absent one.
+	var cleared toolLoopArgs
+	if err := json.Unmarshal([]byte(`{"name":"covers","command":""}`), &cleared); err != nil {
+		t.Fatal(err)
+	}
+	if cleared.Command == nil || *cleared.Command != "" {
+		t.Fatal(`command:"" must bind as an explicit clear`)
+	}
+}
+
 func TestLoopSpecValidation(t *testing.T) {
 	s := func(v string) *string { return &v }
 
