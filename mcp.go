@@ -17,13 +17,13 @@ import (
 
 const serverInstructions = "Events from the everloop channel arrive as " +
 	`<channel source="everloop" kind="tick|message" ...>. ` +
-	`kind="tick" is a persistent systemd-timer loop firing: perform the instruction in the body. ` +
+	`kind="tick" is a persistent scheduled loop firing: perform the instruction in the body. ` +
 	`If coalesced_count is greater than 1, the loop fired that many times while no session was listening - catch up ONCE, do not repeat the work N times. ` +
 	`A command loop's body is its command's output instead: coalesced_count is how many firings produced output, each shown under its own "[everloop] run N of M" header in the order it happened - handle every one, they are different events, not repeats. ` +
 	`status="error" or status="timeout" means the loop's command is failing rather than reporting: the body is a diagnostic, not an instruction. Failures are damped (1st, 2nd, 4th, 8th... consecutive), so one report can stand for many silent failures. ` +
 	`kind="message" is an ad-hoc message pushed from the "everloop send" CLI by the operator or another process. ` +
 	"The channel is one-way: act on events, no reply expected. " +
-	"Manage loops with the create_loop / list_loops / update_loop / delete_loop tools; loops are backed by systemd user timers and never expire."
+	"Manage loops with the create_loop / list_loops / update_loop / delete_loop tools; loops are scheduled outside this session (a systemd user timer, a launchd agent, or the everloop scheduler daemon) and never expire."
 
 type rpcRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -73,6 +73,7 @@ func serve() error {
 	if err := ensureDirs(); err != nil {
 		return err
 	}
+	warnIfNoScheduler()
 	out := &stdoutWriter{enc: json.NewEncoder(os.Stdout)}
 	dlv, err := newSink("everloop", out)
 	if err != nil {
@@ -189,22 +190,22 @@ func toolDefs() []map[string]any {
 	return []map[string]any{
 		{
 			"name": "create_loop",
-			"description": "Create a persistent recurring loop backed by a systemd user timer. It never expires and survives reboots. Provide exactly one of `every` (interval) or `calendar` (systemd OnCalendar expression), and at least one of `message` or `command`.\n\n" +
+			"description": "Create a persistent recurring loop, scheduled outside this session. It never expires and survives reboots and session restarts. Provide exactly one of `every` (interval) or `calendar` (OnCalendar expression), and at least one of `message` or `command`.\n\n" +
 				"Without `command` the loop is a heartbeat: every firing delivers `message` into this session.\n" +
 				"With `command` it is a watch: the command runs on each firing and an event is delivered ONLY if it wrote to stdout — a silent command means no event at all. Prefer this whenever the loop would otherwise start with \"check whether X changed\": let the command do the detecting and stay quiet. `message` then becomes an optional standing instruction shown above the output.",
 			"inputSchema": obj(map[string]any{
 				"name":     str("Loop name: lowercase letters, digits, hyphens (max 41 chars)"),
 				"message":  str("Instruction delivered on each firing; with `command` set, a preamble above the command's output"),
-				"command":  str("Shell command run on each firing (sh -c). Exit 0 with empty stdout delivers nothing; exit 0 with output delivers it; non-zero exit delivers a failure report, damped to the 1st/2nd/4th/8th... consecutive failure. Runs in the systemd user environment, NOT a login shell (~/.profile is not sourced) — use absolute paths."),
+				"command":  str("Shell command run on each firing (sh -c). Exit 0 with empty stdout delivers nothing; exit 0 with output delivers it; non-zero exit delivers a failure report, damped to the 1st/2nd/4th/8th... consecutive failure. Runs in the scheduler's environment, NOT a login shell (~/.profile is not sourced) — use absolute paths."),
 				"timeout":  str("Max command runtime like 30s, 2m (default 60s, range 1s..1h). A timeout is reported as a damped failure."),
 				"every":    str("Interval like 90s, 5m, 1h30m, 2d (min 10s). Mutually exclusive with calendar."),
-				"calendar": str("systemd OnCalendar expression like 'Mon..Fri 09:00' or 'daily'. Missed fires run at next boot. Mutually exclusive with every."),
+				"calendar": str("OnCalendar expression like 'Mon..Fri 09:00', 'daily' or '*-*-* 09:00:00'. A fire missed while the machine was down runs once when it comes back. Mutually exclusive with every."),
 				"enabled":  map[string]any{"type": "boolean", "description": "Start the timer immediately (default true)"},
 			}, "name"),
 		},
 		{
 			"name":        "list_loops",
-			"description": "List all persistent loops with their schedule, enabled state, command (if any), and live systemd timer status.",
+			"description": "List all persistent loops with their schedule, enabled state, command (if any), and live timer status. The status names the scheduler backend holding each loop, and says so loudly when nothing is scheduling it.",
 			"inputSchema": obj(map[string]any{}),
 		},
 		{
@@ -216,13 +217,13 @@ func toolDefs() []map[string]any {
 				"command":  str("New command; empty string clears it"),
 				"timeout":  str("New command timeout like 30s, 2m"),
 				"every":    str("New interval like 90s, 5m, 1h30m, 2d"),
-				"calendar": str("New systemd OnCalendar expression"),
+				"calendar": str("New OnCalendar expression"),
 				"enabled":  map[string]any{"type": "boolean", "description": "Enable or disable the timer"},
 			}, "name"),
 		},
 		{
 			"name":        "delete_loop",
-			"description": "Delete a loop: stops and removes its systemd timer and discards any pending tick.",
+			"description": "Delete a loop: stops and removes its timer and discards any pending tick.",
 			"inputSchema": obj(map[string]any{"name": str("Name of the loop to delete")}, "name"),
 		},
 		{

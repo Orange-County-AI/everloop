@@ -14,7 +14,9 @@ import (
 	"time"
 )
 
-// Loop is a persistent recurring instruction backed by a systemd user timer.
+// Loop is a persistent recurring instruction backed by whichever scheduler
+// backend is live: a systemd user timer, a launchd agent, or everloop's own
+// scheduler daemon (see backend.go).
 //
 // Two shapes share the struct. With Command empty it is a heartbeat: every
 // firing spools Message. With Command set it is a watch: every firing runs the
@@ -29,7 +31,7 @@ type Loop struct {
 	Command   string    `json:"command,omitempty"`  // watch: run this each firing, spool only on output
 	Timeout   string    `json:"timeout,omitempty"`  // max command runtime, default 60s
 	Every     string    `json:"every,omitempty"`    // interval, e.g. "1h30m", "2d"
-	Calendar  string    `json:"calendar,omitempty"` // systemd OnCalendar expression
+	Calendar  string    `json:"calendar,omitempty"` // OnCalendar expression, e.g. "Mon..Fri 09:00"
 	Enabled   bool      `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -88,7 +90,7 @@ var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)
 // instanceName isolates one everloop from another: several long-lived sessions
 // (each an MCP `serve`) must not share a spool or they would steal each other's
 // ticks. Set EVERLOOP_INSTANCE per session to give it its own data dir and
-// systemd unit namespace. Empty = the default (single-user) instance.
+// timer namespace. Empty = the default (single-user) instance.
 func instanceName() string { return os.Getenv("EVERLOOP_INSTANCE") }
 
 // checkInstance validates the instance name, which becomes both a filesystem
@@ -117,7 +119,7 @@ func loopsDir() string { return filepath.Join(dataDir(), "loops") }
 func queueDir() string { return filepath.Join(dataDir(), "queue") }
 
 func ensureDirs() error {
-	for _, d := range []string{loopsDir(), queueDir(), stateDir()} {
+	for _, d := range []string{loopsDir(), queueDir(), stateDir(), scheduleDir()} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return err
 		}
