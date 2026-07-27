@@ -38,6 +38,51 @@ One Go binary, three roles:
 Delivery is at-least-once (claim → notify → ack); each event carries an
 `event_id` meta attribute usable as an idempotency key.
 
+## Watch, don't sweep (`--command`)
+
+**Default to a command loop.** A plain loop is a heartbeat: it fires the same
+message every interval and the session usually burns a turn concluding "nothing
+changed". A `--command` loop is a watch — the command runs each firing and an
+event is delivered **only if it wrote to stdout**:
+
+```bash
+everloop create covers --command "/opt/stub/luma-watch.py check" --every 10m \
+  --message "A Luma event changed. Judge whether the change looks accidental."
+```
+
+If you catch yourself writing a message that starts "check whether X changed",
+the checking belongs in a command. Change detection is cheap and belongs in a
+script; judgement is expensive and should only run when there is something to
+judge.
+
+- exit 0 + no stdout → **nothing is delivered**. Silence is the feature.
+- exit 0 + stdout → an event whose body is that output.
+- non-zero exit or timeout → a failure report, damped to the 1st/2nd/4th/8th...
+  consecutive failure plus one recovery notice. `--timeout` bounds a run
+  (default 60s).
+- `--message` is optional here and renders as a preamble above the output, so
+  the loop can still carry standing instructions.
+- `everloop update NAME --command ""` turns a watch back into a heartbeat.
+
+**Reading the events.** A command loop's `coalesced_count` is the number of
+firings that produced output, each under its own `[everloop] run N of M`
+header, in order. Unlike a static tick these are *different* events, not
+repeats — handle every one, don't collapse them. `status="error"` /
+`status="timeout"` marks a body that is a diagnostic rather than an
+instruction.
+
+**Writing the command.** It runs in the systemd user environment (launchd on
+macOS), **not a login shell** — `~/.profile` is not sourced, so no fnox/mise/
+direnv activation and no interactive-shell secrets. Use absolute paths, have
+the script fetch its own secrets (`fnox get KEY`), and test it the way the
+timer will run it:
+
+```bash
+systemd-run --user --wait --pipe --quiet /full/path/to/your-command
+```
+
+A command that works pasted into a terminal can still fail under the timer.
+
 ## Managing loops
 
 The channel server, when connected, exposes these MCP tools (prefer them inside
@@ -48,6 +93,9 @@ use the CLI — it is the same operations:
 ```bash
 # interval loop (90s, 5m, 1h30m, 2d — minimum 10s)
 everloop create reconcile --message "Reconcile the ledger and report anomalies." --every 1h
+
+# command loop — silent unless the command prints something (see below)
+everloop create covers --command "/opt/stub/luma-watch.py check" --every 10m
 
 # calendar loop (systemd OnCalendar syntax; a fire missed while off runs at next boot)
 everloop create standup --message "Draft the daily standup summary." --calendar "Mon..Fri 09:00"
@@ -62,8 +110,9 @@ everloop delete reconcile
 everloop send "deploy finished: v1.2.3"
 ```
 
-Exactly one of `--every` / `--calendar` per loop; setting one clears the other.
-Names are lowercase letters, digits, hyphens (≤41 chars). Invalid intervals and
+Exactly one of `--every` / `--calendar` per loop, and at least one of
+`--message` / `--command`; setting one schedule clears the other. Names are
+lowercase letters, digits, hyphens (≤41 chars). Invalid intervals, timeouts and
 `OnCalendar` expressions are rejected up front.
 
 ## Connecting a session to receive firings
