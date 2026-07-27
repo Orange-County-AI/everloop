@@ -233,6 +233,16 @@ func toolDefs() []map[string]any {
 	}
 }
 
+// toolLoopArgs is the create_loop/update_loop argument shape. Embedding
+// loopSpec means the tools and the CLI reach validation through exactly the
+// same path, and an omitted key stays nil rather than becoming "" — which is
+// what lets `command: ""` mean "clear it" without an omitted `command`
+// wiping one.
+type toolLoopArgs struct {
+	Name string
+	loopSpec
+}
+
 func handleToolCall(out *stdoutWriter, req rpcRequest) {
 	var call struct {
 		Name      string          `json:"name"`
@@ -258,10 +268,7 @@ func handleToolCall(out *stdoutWriter, req rpcRequest) {
 func dispatchTool(name string, args json.RawMessage) (string, error) {
 	switch name {
 	case "create_loop":
-		var a struct {
-			Name string
-			loopSpec
-		}
+		var a toolLoopArgs
 		if err := json.Unmarshal(args, &a); err != nil {
 			return "", err
 		}
@@ -289,10 +296,7 @@ func dispatchTool(name string, args json.RawMessage) (string, error) {
 		}
 		return string(b), nil
 	case "update_loop":
-		var a struct {
-			Name string
-			loopSpec
-		}
+		var a toolLoopArgs
 		if err := json.Unmarshal(args, &a); err != nil {
 			return "", err
 		}
