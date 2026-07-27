@@ -153,6 +153,22 @@ func TestNextFireAnchorsToScheduleAndSnapsForward(t *testing.T) {
 	}
 }
 
+// A calendar loop has no interval to divide by, so the miss count is walked
+// from the expression. It is log-only, but a wrong number in the one line an
+// operator reads after an outage is worse than no number.
+func TestMissedFiresCountsCalendarOccurrences(t *testing.T) {
+	l := &Loop{Calendar: "daily"}
+	midnight := time.Now().In(time.Local).Truncate(24 * time.Hour)
+	due := midnight.AddDate(0, 0, -3)
+
+	if got := missedFires(l, due, midnight.Add(12*time.Hour)); got != 4 {
+		t.Fatalf("missedFires over three days of downtime = %d, want 4", got)
+	}
+	if got := missedFires(l, midnight.AddDate(0, 0, 1), midnight.Add(time.Hour)); got != 0 {
+		t.Fatalf("missedFires for a loop that is not due = %d, want 0", got)
+	}
+}
+
 func TestResolveBackendHonoursTheEnvironment(t *testing.T) {
 	t.Setenv("EVERLOOP_BACKEND", "portable")
 	b, err := resolveBackend()

@@ -136,6 +136,10 @@ func nextFire(l *Loop, from, now time.Time) (time.Time, error) {
 	return t, nil
 }
 
+// maxCountedMisses bounds the calendar walk below. A loop down long enough to
+// miss more than this has a number nobody is going to act on differently.
+const maxCountedMisses = 10000
+
 // missedFires is how many fires were skipped while nothing was scheduling —
 // for the LOG only. The loop fires exactly once regardless, which is both
 // systemd's behaviour and what the session is told to expect: a coalesced tick
@@ -145,9 +149,17 @@ func missedFires(l *Loop, next, now time.Time) int {
 		return 0
 	}
 	if l.Calendar != "" {
-		// Counting calendar occurrences means walking them; the daemon only
-		// wants to say "you missed some", so don't pay for the exact number.
-		return 1
+		// No arithmetic shortcut for an OnCalendar expression, so walk it. This
+		// runs once per catch-up, never on the ordinary path.
+		n := 0
+		for t := next; !t.After(now) && n < maxCountedMisses; n++ {
+			nt, err := nextCalendar(l.Calendar, t)
+			if err != nil {
+				break
+			}
+			t = nt
+		}
+		return n
 	}
 	d, err := parseEvery(l.Every)
 	if err != nil || d <= 0 {
@@ -198,6 +210,14 @@ func (portable) timerStatus(name string) string {
 	}
 	st, ok := loadSchedState(name)
 	if !ok {
+		// Not armed is usually harmless — the daemon adopts it on its next
+		// pass. Unless it cannot, which is the one case worth spelling out: a
+		// loop carried over from a systemd host can hold an OnCalendar
+		// expression this backend refuses, and would otherwise sit here looking
+		// merely new.
+		if _, err := nextFire(l, time.Now(), time.Now()); err != nil {
+			return fmt.Sprintf("portable: NOT SCHEDULED: %v", err)
+		}
 		return "portable: not armed (the scheduler will adopt it)" + warn
 	}
 	return fmt.Sprintf("portable: next %s%s", st.NextRunAt.Local().Format("Mon 2006-01-02 15:04:05 MST"), warn)

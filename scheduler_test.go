@@ -243,6 +243,60 @@ func TestCalendarLoopFiresAndReschedulesFromTheExpression(t *testing.T) {
 	}
 }
 
+// Loops are updated by other processes entirely, so an update can land while a
+// fire is in flight. The update wins — it is the schedule the operator just
+// chose, whereas the firing goroutine would extend the one they replaced.
+func TestAnUpdateDuringAFireIsNotClobbered(t *testing.T) {
+	l := newTestLoop(t, Loop{Name: "sweep", Message: "sweep", Every: "1h"})
+	arm(t, l.Name, time.Now().Add(-time.Second))
+
+	started, release := make(chan struct{}), make(chan struct{})
+	s, _ := testScheduler(t)
+	s.fire = func(string) error {
+		close(started)
+		<-release
+		return nil
+	}
+
+	s.pass(time.Now())
+	<-started
+	// Another process re-arms the loop: `everloop update sweep --every 10s`.
+	rearmed := time.Now().Add(10 * time.Second).Round(0)
+	arm(t, l.Name, rearmed)
+	close(release)
+	s.wg.Wait()
+
+	if st := armed(t, l.Name); !st.NextRunAt.Equal(rearmed) {
+		t.Fatalf("next fire is %s, want the mid-fire update's %s", st.NextRunAt, rearmed)
+	}
+}
+
+// A loop carried over from a systemd host can hold a calendar expression this
+// backend refuses. It must not be scheduled, must say so — and must say so
+// once, not once per second for as long as the daemon runs.
+func TestUnschedulableLoopIsReportedOnceAndNotScheduled(t *testing.T) {
+	// systemd accepts a timezone suffix; this backend does not.
+	l := newTestLoop(t, Loop{Name: "legacy", Message: "x", Calendar: "Mon..Fri 09:00 Europe/London"})
+
+	s, logs := testScheduler(t)
+	for range 3 {
+		runPass(s, time.Now())
+	}
+
+	if _, ok := loadSchedState(l.Name); ok {
+		t.Fatal("armed a loop whose schedule cannot be computed")
+	}
+	if _, ok := pendingTick(t, l.Name); ok {
+		t.Fatal("fired a loop whose schedule cannot be computed")
+	}
+	if n := strings.Count(logs.String(), "unusable schedule"); n != 1 {
+		t.Fatalf("complained %d times across 3 passes, want 1:\n%s", n, logs.String())
+	}
+	if got := (portable{}).timerStatus(l.Name); !strings.Contains(got, "NOT SCHEDULED") {
+		t.Fatalf("status %q hides that the loop will never fire", got)
+	}
+}
+
 // A loop file hand-edited into something unschedulable must back off rather
 // than spin: leaving its next-fire time in the past re-fires it every scan.
 func TestUnschedulableLoopBacksOffInsteadOfSpinning(t *testing.T) {

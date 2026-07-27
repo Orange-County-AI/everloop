@@ -121,6 +121,7 @@ type scheduler struct {
 
 	mu       sync.Mutex
 	inflight map[string]bool // loop -> already warned about the overrun
+	unusable map[string]bool // loops whose schedule we have already complained about
 	wg       sync.WaitGroup
 }
 
@@ -130,6 +131,7 @@ func newScheduler() *scheduler {
 		logf:     stdoutLogf,
 		now:      time.Now,
 		inflight: map[string]bool{},
+		unusable: map[string]bool{},
 	}
 }
 
@@ -203,7 +205,14 @@ func (s *scheduler) pass(now time.Time) {
 func (s *scheduler) adopt(l *Loop, now time.Time) {
 	next, err := nextFire(l, now, now)
 	if err != nil {
-		s.logf("loop %q has an unusable schedule (%v); not scheduling it", l.Name, err)
+		// Reachable when a data dir moves from a systemd host, where the
+		// calendar expression was systemd's to validate. Say it once: the pass
+		// runs every second, and a line a second buries everything else in the
+		// log the operator came to read.
+		if !s.unusable[l.Name] {
+			s.unusable[l.Name] = true
+			s.logf("loop %q has an unusable schedule (%v); NOT scheduling it", l.Name, err)
+		}
 		return
 	}
 	st := schedState{Name: l.Name, NextRunAt: next}
@@ -211,6 +220,7 @@ func (s *scheduler) adopt(l *Loop, now time.Time) {
 		s.logf("loop %q: cannot write schedule state: %v", l.Name, err)
 		return
 	}
+	delete(s.unusable, l.Name)
 	s.logf("adopted loop %q (%s): first fire %s", l.Name, scheduleDesc(l), next.Format(time.RFC3339))
 }
 
@@ -243,7 +253,6 @@ func (s *scheduler) runFire(l *Loop, st schedState, now time.Time) {
 	// stops is the failure everloop exists to make impossible. Delivery is
 	// already at-least-once for exactly this reason.
 	end := s.now()
-	st.LastRunAt, st.Fires = end.UTC(), st.Fires+1
 	next, err := nextFire(l, st.NextRunAt, end)
 	if err != nil {
 		// Only reachable if the loop file was hand-edited into something
@@ -252,7 +261,13 @@ func (s *scheduler) runFire(l *Loop, st schedState, now time.Time) {
 		s.logf("loop %q: cannot compute the next fire (%v); retrying in a minute", l.Name, err)
 		next = end.Add(time.Minute)
 	}
-	st.NextRunAt = next
+	// An update landing mid-fire re-armed the loop from now, in another
+	// process. That wins: it is a schedule the operator just chose, whereas
+	// ours extends the one they replaced.
+	if cur, ok := loadSchedState(l.Name); ok && !cur.NextRunAt.Equal(st.NextRunAt) {
+		next = cur.NextRunAt
+	}
+	st.LastRunAt, st.Fires, st.NextRunAt = end.UTC(), st.Fires+1, next
 	if err := saveSchedState(st); err != nil {
 		s.logf("loop %q: cannot write schedule state (%v); it may fire again", l.Name, err)
 	}
