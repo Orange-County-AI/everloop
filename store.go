@@ -15,26 +15,65 @@ import (
 )
 
 // Loop is a persistent recurring instruction backed by a systemd user timer.
+//
+// Two shapes share the struct. With Command empty it is a heartbeat: every
+// firing spools Message. With Command set it is a watch: every firing runs the
+// command and spools only if there was something to say (see command.go).
+// Command is deliberately generic rather than named for the timer — the
+// planned streaming loops (docs/streaming.md) run the same command string under
+// a supervised unit instead of a timer, discriminated by a future `mode` field
+// whose zero value is today's timer behaviour.
 type Loop struct {
 	Name      string    `json:"name"`
 	Message   string    `json:"message"`
-	Every     string    `json:"every,omitempty"`    // interval, e.g. "1h30m", "2d"
-	Calendar  string    `json:"calendar,omitempty"` // systemd OnCalendar expression
+	Command   string    `json:"command,omitempty"` // watch: run this each firing, spool only on output
+	Timeout   string    `json:"timeout,omitempty"` // max command runtime, default 60s
+	Every     string    `json:"every,omitempty"`   // interval, e.g. "1h30m", "2d"
+	Calendar  string    `json:"calendar,omitempty"`
 	Enabled   bool      `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // QueueMsg is one spooled message awaiting delivery to a session.
+//
+// Content is always the exact body to deliver, so sinks never care how it was
+// produced. Runs is the command-loop provenance behind it: one entry per
+// firing that had something to say, kept so a later firing can append to an
+// undelivered event without re-parsing its rendered text.
 type QueueMsg struct {
 	ID      string            `json:"id"`
 	Kind    string            `json:"kind"` // "tick" or "message"
 	Loop    string            `json:"loop,omitempty"`
 	Content string            `json:"content"`
 	Count   int               `json:"count"`
+	Runs    []runOutput       `json:"runs,omitempty"`
+	Dropped int               `json:"dropped,omitempty"`
 	Meta    map[string]string `json:"meta,omitempty"`
 	FirstAt time.Time         `json:"first_at"`
 	LastAt  time.Time         `json:"last_at"`
+}
+
+// runOutput is one command firing worth delivering. Status is "" for ordinary
+// output, "error"/"timeout" for a reported failure, "recovered" for the single
+// notice that a broken watch started working again.
+type runOutput struct {
+	At     time.Time `json:"at"`
+	Text   string    `json:"text"`
+	Status string    `json:"status,omitempty"`
+	Exit   int       `json:"exit,omitempty"`
+}
+
+// status summarises an event for the delivery meta, so an agent can tell a
+// failure report from a watch hit without parsing the body.
+func (m QueueMsg) status() string {
+	s := ""
+	for _, r := range m.Runs {
+		if r.Status == "error" || r.Status == "timeout" {
+			s = r.Status
+		}
+	}
+	return s
 }
 
 var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)
@@ -71,7 +110,7 @@ func loopsDir() string { return filepath.Join(dataDir(), "loops") }
 func queueDir() string { return filepath.Join(dataDir(), "queue") }
 
 func ensureDirs() error {
-	for _, d := range []string{loopsDir(), queueDir()} {
+	for _, d := range []string{loopsDir(), queueDir(), stateDir()} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return err
 		}
@@ -172,6 +211,10 @@ func listLoops() ([]*Loop, error) {
 // enqueueTick records a loop firing. At most one pending tick per loop:
 // repeat firings bump Count and refresh the message, so an outage can never
 // flood the session.
+//
+// A command loop takes the other branch: it may spool nothing at all, and when
+// it does spool it accumulates rather than overwrites, because unlike a static
+// message every firing carries different output. See appendTickRuns.
 func enqueueTick(name string) error {
 	l, err := loadLoop(name)
 	if err != nil {
@@ -179,6 +222,9 @@ func enqueueTick(name string) error {
 	}
 	if !l.Enabled {
 		return nil
+	}
+	if l.Command != "" {
+		return enqueueCommandTick(l)
 	}
 	return withQueueLock(func() error {
 		path := filepath.Join(queueDir(), "tick-"+name+".json")

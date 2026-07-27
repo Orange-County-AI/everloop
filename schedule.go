@@ -51,31 +51,83 @@ func parseEvery(s string) (time.Duration, error) {
 
 // --- high-level loop operations (shared by CLI and MCP tools) ----------------
 
-func createLoop(name, message, every, calendar string, enabled bool) (*Loop, error) {
+// loopSpec is the mutable surface of a Loop, shared by create and update so
+// both paths validate identically. A nil field means "leave alone"; the CLI
+// only fills in flags the user actually passed (see setFlags) and the MCP tools
+// get the same distinction free from JSON pointers.
+type loopSpec struct {
+	Message  *string
+	Command  *string
+	Timeout  *string
+	Every    *string
+	Calendar *string
+	Enabled  *bool
+}
+
+// apply folds a spec into a loop and validates the result. Clearing semantics
+// differ by field on purpose: Command and Timeout accept "" as an explicit
+// clear (turning a watch back into a heartbeat), while Every/Calendar treat ""
+// as "not supplied" — you switch schedule kinds by setting the other one, and
+// a loop with neither has no way to fire.
+func (s loopSpec) apply(l *Loop) error {
+	if s.Message != nil {
+		l.Message = *s.Message
+	}
+	if s.Command != nil {
+		l.Command = *s.Command
+	}
+	if s.Timeout != nil {
+		l.Timeout = *s.Timeout
+	}
+	if s.Every != nil && *s.Every != "" {
+		l.Every, l.Calendar = *s.Every, ""
+	}
+	if s.Calendar != nil && *s.Calendar != "" {
+		l.Calendar, l.Every = *s.Calendar, ""
+	}
+	if s.Enabled != nil {
+		l.Enabled = *s.Enabled
+	}
+
+	if l.Command == "" {
+		// A timeout is meaningless without a command; drop it silently when the
+		// command is cleared so the leftover can't fail a later validation.
+		l.Timeout = ""
+		if l.Message == "" {
+			return fmt.Errorf("message is required (or set a command)")
+		}
+	}
+	if (l.Every == "") == (l.Calendar == "") {
+		return fmt.Errorf("exactly one of every/calendar is required")
+	}
+	if l.Every != "" {
+		if _, err := parseEvery(l.Every); err != nil {
+			return err
+		}
+	}
+	if l.Calendar != "" {
+		if err := validateCalendar(l.Calendar); err != nil {
+			return err
+		}
+	}
+	if _, err := parseTimeout(l.Timeout); err != nil {
+		return err
+	}
+	return nil
+}
+
+func createLoop(name string, spec loopSpec) (*Loop, error) {
 	if err := validName(name); err != nil {
 		return nil, err
-	}
-	if message == "" {
-		return nil, fmt.Errorf("message is required")
-	}
-	if (every == "") == (calendar == "") {
-		return nil, fmt.Errorf("exactly one of every/calendar is required")
 	}
 	if _, err := os.Stat(loopPath(name)); err == nil {
 		return nil, fmt.Errorf("loop %q already exists", name)
 	}
-	if every != "" {
-		if _, err := parseEvery(every); err != nil {
-			return nil, err
-		}
-	}
-	if calendar != "" {
-		if err := validateCalendar(calendar); err != nil {
-			return nil, err
-		}
-	}
 	now := time.Now().UTC()
-	l := &Loop{Name: name, Message: message, Every: every, Calendar: calendar, Enabled: enabled, CreatedAt: now, UpdatedAt: now}
+	l := &Loop{Name: name, Enabled: true, CreatedAt: now, UpdatedAt: now}
+	if err := spec.apply(l); err != nil {
+		return nil, err
+	}
 	if err := saveLoop(l); err != nil {
 		return nil, err
 	}
@@ -86,31 +138,13 @@ func createLoop(name, message, every, calendar string, enabled bool) (*Loop, err
 	return l, nil
 }
 
-func updateLoop(name string, message, every, calendar *string, enabled *bool) (*Loop, error) {
+func updateLoop(name string, spec loopSpec) (*Loop, error) {
 	l, err := loadLoop(name)
 	if err != nil {
 		return nil, fmt.Errorf("loop %q not found", name)
 	}
-	if message != nil {
-		if *message == "" {
-			return nil, fmt.Errorf("message cannot be empty")
-		}
-		l.Message = *message
-	}
-	if every != nil && *every != "" {
-		if _, err := parseEvery(*every); err != nil {
-			return nil, err
-		}
-		l.Every, l.Calendar = *every, ""
-	}
-	if calendar != nil && *calendar != "" {
-		if err := validateCalendar(*calendar); err != nil {
-			return nil, err
-		}
-		l.Calendar, l.Every = *calendar, ""
-	}
-	if enabled != nil {
-		l.Enabled = *enabled
+	if err := spec.apply(l); err != nil {
+		return nil, err
 	}
 	l.UpdatedAt = time.Now().UTC()
 	if err := saveLoop(l); err != nil {
@@ -130,5 +164,6 @@ func deleteLoop(name string) error {
 		return err
 	}
 	os.Remove(filepath.Join(queueDir(), "tick-"+name+".json"))
+	os.Remove(runStatePath(name)) // damping memory dies with the loop
 	return os.Remove(loopPath(name))
 }

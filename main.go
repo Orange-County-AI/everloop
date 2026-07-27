@@ -20,15 +20,18 @@ const usage = `everloop %s - persistent loops for Claude Code, backed by OS time
 
 Usage:
   everloop serve                                 run as MCP channel server (stdio)
-  everloop create NAME --message M (--every D | --calendar C) [--disabled]
+  everloop create NAME (--message M | --command C) (--every D | --calendar C) [--timeout T] [--disabled]
   everloop list
-  everloop update NAME [--message M] [--every D] [--calendar C] [--enable|--disable]
+  everloop update NAME [--message M] [--command C] [--timeout T] [--every D] [--calendar C] [--enable|--disable]
   everloop delete NAME
   everloop send MESSAGE                          spool an ad-hoc message to the session
   everloop tick NAME                             (called by the OS timer) spool one loop firing
 
 Intervals: 90s, 5m, 1h30m, 2d (min 10s). Calendar: systemd OnCalendar syntax
 (macOS supports a subset: hourly, daily, weekly, "*-*-* HH:MM", "Mon *-*-* HH:MM").
+With --command the loop is a watch: the command runs each firing and an event is
+spooled only when it writes to stdout (--timeout bounds it, default 60s). The
+command runs in the OS timer's environment, not a login shell.
 State: ~/.local/share/everloop
 Timers: ~/.config/systemd/user/everloop-*.timer (Linux)
         ~/Library/LaunchAgents/com.52labs.everloop.*.plist (macOS)
@@ -85,20 +88,56 @@ func main() {
 	}
 }
 
+// loopFlags registers the flags create and update share and returns a spec
+// carrying only the ones the user actually passed. The distinction matters:
+// `--command ""` must clear a command (turning a watch back into a heartbeat),
+// while an omitted --command must leave it alone.
+func loopFlags(fs *flag.FlagSet, args []string) (loopSpec, error) {
+	message := fs.String("message", "", "instruction delivered on each firing")
+	command := fs.String("command", "", "run this each firing; spool only if it writes to stdout")
+	timeout := fs.String("timeout", "", "max command runtime (default 60s)")
+	every := fs.String("every", "", "interval (90s, 5m, 1h30m, 2d)")
+	calendar := fs.String("calendar", "", "systemd OnCalendar expression")
+	if err := fs.Parse(args); err != nil {
+		return loopSpec{}, err
+	}
+	seen := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { seen[f.Name] = true })
+	var spec loopSpec
+	if seen["message"] {
+		spec.Message = message
+	}
+	if seen["command"] {
+		spec.Command = command
+	}
+	if seen["timeout"] {
+		spec.Timeout = timeout
+	}
+	if seen["every"] {
+		spec.Every = every
+	}
+	if seen["calendar"] {
+		spec.Calendar = calendar
+	}
+	return spec, nil
+}
+
 func cmdCreate(args []string) error {
 	if len(args) < 1 || args[0] == "" || args[0][0] == '-' {
-		return fmt.Errorf("usage: everloop create NAME --message M (--every D | --calendar C)")
+		return fmt.Errorf("usage: everloop create NAME (--message M | --command C) (--every D | --calendar C)")
 	}
 	name := args[0]
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
-	message := fs.String("message", "", "instruction delivered on each firing")
-	every := fs.String("every", "", "interval (90s, 5m, 1h30m, 2d)")
-	calendar := fs.String("calendar", "", "systemd OnCalendar expression")
 	disabled := fs.Bool("disabled", false, "create without starting the timer")
-	if err := fs.Parse(args[1:]); err != nil {
+	spec, err := loopFlags(fs, args[1:])
+	if err != nil {
 		return err
 	}
-	l, err := createLoop(name, *message, *every, *calendar, !*disabled)
+	if *disabled {
+		f := false
+		spec.Enabled = &f
+	}
+	l, err := createLoop(name, spec)
 	if err != nil {
 		return err
 	}
@@ -116,46 +155,38 @@ func cmdList() error {
 		return nil
 	}
 	for _, l := range loops {
-		fmt.Printf("- %s: %s | enabled=%v | timer=%s\n    message: %s\n",
-			l.Name, scheduleDesc(l), l.Enabled, timerStatus(l.Name), l.Message)
+		fmt.Printf("- %s: %s | enabled=%v | timer=%s\n", l.Name, scheduleDesc(l), l.Enabled, timerStatus(l.Name))
+		if l.Command != "" {
+			fmt.Printf("    command: %s (timeout %s)\n", l.Command, timeoutDesc(l))
+		}
+		if l.Message != "" {
+			fmt.Printf("    message: %s\n", l.Message)
+		}
 	}
 	return nil
 }
 
 func cmdUpdate(args []string) error {
 	if len(args) < 1 || args[0] == "" || args[0][0] == '-' {
-		return fmt.Errorf("usage: everloop update NAME [--message M] [--every D] [--calendar C] [--enable|--disable]")
+		return fmt.Errorf("usage: everloop update NAME [--message M] [--command C] [--timeout T] [--every D] [--calendar C] [--enable|--disable]")
 	}
 	name := args[0]
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
-	message := fs.String("message", "", "new message")
-	every := fs.String("every", "", "new interval")
-	calendar := fs.String("calendar", "", "new OnCalendar expression")
 	enable := fs.Bool("enable", false, "enable the timer")
 	disable := fs.Bool("disable", false, "disable the timer")
-	if err := fs.Parse(args[1:]); err != nil {
+	spec, err := loopFlags(fs, args[1:])
+	if err != nil {
 		return err
-	}
-	var msgP, everyP, calP *string
-	var enabledP *bool
-	if *message != "" {
-		msgP = message
-	}
-	if *every != "" {
-		everyP = every
-	}
-	if *calendar != "" {
-		calP = calendar
 	}
 	if *enable {
 		t := true
-		enabledP = &t
+		spec.Enabled = &t
 	}
 	if *disable {
 		f := false
-		enabledP = &f
+		spec.Enabled = &f
 	}
-	l, err := updateLoop(name, msgP, everyP, calP, enabledP)
+	l, err := updateLoop(name, spec)
 	if err != nil {
 		return err
 	}

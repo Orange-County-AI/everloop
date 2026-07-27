@@ -19,6 +19,8 @@ const serverInstructions = "Events from the everloop channel arrive as " +
 	`<channel source="everloop" kind="tick|message" ...>. ` +
 	`kind="tick" is a persistent systemd-timer loop firing: perform the instruction in the body. ` +
 	`If coalesced_count is greater than 1, the loop fired that many times while no session was listening - catch up ONCE, do not repeat the work N times. ` +
+	`A command loop's body is its command's output instead: coalesced_count is how many firings produced output, each shown under its own "[everloop] run N of M" header in the order it happened - handle every one, they are different events, not repeats. ` +
+	`status="error" or status="timeout" means the loop's command is failing rather than reporting: the body is a diagnostic, not an instruction. Failures are damped (1st, 2nd, 4th, 8th... consecutive), so one report can stand for many silent failures. ` +
 	`kind="message" is an ad-hoc message pushed from the "everloop send" CLI by the operator or another process. ` +
 	"The channel is one-way: act on events, no reply expected. " +
 	"Manage loops with the create_loop / list_loops / update_loop / delete_loop tools; loops are backed by systemd user timers and never expire."
@@ -155,6 +157,9 @@ func drainLoop(dlv sink) {
 			if c.msg.Kind == "tick" {
 				meta["coalesced_count"] = strconv.Itoa(c.msg.Count)
 			}
+			if s := c.msg.status(); s != "" {
+				meta["status"] = s
+			}
 			for k, v := range c.msg.Meta {
 				meta[k] = v
 			}
@@ -183,27 +188,33 @@ func toolDefs() []map[string]any {
 	}
 	return []map[string]any{
 		{
-			"name":        "create_loop",
-			"description": "Create a persistent recurring loop backed by a systemd user timer. It never expires and survives reboots. Provide exactly one of `every` (interval) or `calendar` (systemd OnCalendar expression). Each firing delivers the message into this session as a channel event.",
+			"name": "create_loop",
+			"description": "Create a persistent recurring loop backed by a systemd user timer. It never expires and survives reboots. Provide exactly one of `every` (interval) or `calendar` (systemd OnCalendar expression), and at least one of `message` or `command`.\n\n" +
+				"Without `command` the loop is a heartbeat: every firing delivers `message` into this session.\n" +
+				"With `command` it is a watch: the command runs on each firing and an event is delivered ONLY if it wrote to stdout — a silent command means no event at all. Prefer this whenever the loop would otherwise start with \"check whether X changed\": let the command do the detecting and stay quiet. `message` then becomes an optional standing instruction shown above the output.",
 			"inputSchema": obj(map[string]any{
 				"name":     str("Loop name: lowercase letters, digits, hyphens (max 41 chars)"),
-				"message":  str("The instruction delivered to the session on each firing"),
+				"message":  str("Instruction delivered on each firing; with `command` set, a preamble above the command's output"),
+				"command":  str("Shell command run on each firing (sh -c). Exit 0 with empty stdout delivers nothing; exit 0 with output delivers it; non-zero exit delivers a failure report, damped to the 1st/2nd/4th/8th... consecutive failure. Runs in the systemd user environment, NOT a login shell (~/.profile is not sourced) — use absolute paths."),
+				"timeout":  str("Max command runtime like 30s, 2m (default 60s, range 1s..1h). A timeout is reported as a damped failure."),
 				"every":    str("Interval like 90s, 5m, 1h30m, 2d (min 10s). Mutually exclusive with calendar."),
 				"calendar": str("systemd OnCalendar expression like 'Mon..Fri 09:00' or 'daily'. Missed fires run at next boot. Mutually exclusive with every."),
 				"enabled":  map[string]any{"type": "boolean", "description": "Start the timer immediately (default true)"},
-			}, "name", "message"),
+			}, "name"),
 		},
 		{
 			"name":        "list_loops",
-			"description": "List all persistent loops with their schedule, enabled state, and live systemd timer status.",
+			"description": "List all persistent loops with their schedule, enabled state, command (if any), and live systemd timer status.",
 			"inputSchema": obj(map[string]any{}),
 		},
 		{
 			"name":        "update_loop",
-			"description": "Update a loop's message, schedule, or enabled state. Setting `every` clears `calendar` and vice versa. Interval changes reschedule from now.",
+			"description": "Update a loop's message, command, schedule, or enabled state. Setting `every` clears `calendar` and vice versa. Interval changes reschedule from now. Passing an empty string for `command` clears it, turning a watch back into a plain heartbeat.",
 			"inputSchema": obj(map[string]any{
 				"name":     str("Name of the loop to update"),
 				"message":  str("New message"),
+				"command":  str("New command; empty string clears it"),
+				"timeout":  str("New command timeout like 30s, 2m"),
 				"every":    str("New interval like 90s, 5m, 1h30m, 2d"),
 				"calendar": str("New systemd OnCalendar expression"),
 				"enabled":  map[string]any{"type": "boolean", "description": "Enable or disable the timer"},
@@ -248,14 +259,13 @@ func dispatchTool(name string, args json.RawMessage) (string, error) {
 	switch name {
 	case "create_loop":
 		var a struct {
-			Name, Message, Every, Calendar string
-			Enabled                        *bool
+			Name string
+			loopSpec
 		}
 		if err := json.Unmarshal(args, &a); err != nil {
 			return "", err
 		}
-		enabled := a.Enabled == nil || *a.Enabled
-		l, err := createLoop(a.Name, a.Message, a.Every, a.Calendar, enabled)
+		l, err := createLoop(a.Name, a.loopSpec)
 		if err != nil {
 			return "", err
 		}
@@ -270,22 +280,23 @@ func dispatchTool(name string, args json.RawMessage) (string, error) {
 		}
 		var b []byte
 		for _, l := range loops {
-			b = fmt.Appendf(b, "- %s: %s | enabled=%v | timer=%s | message=%q\n",
+			b = fmt.Appendf(b, "- %s: %s | enabled=%v | timer=%s | message=%q",
 				l.Name, scheduleDesc(l), l.Enabled, timerStatus(l.Name), l.Message)
+			if l.Command != "" {
+				b = fmt.Appendf(b, " | command=%q (timeout %s)", l.Command, timeoutDesc(l))
+			}
+			b = append(b, '\n')
 		}
 		return string(b), nil
 	case "update_loop":
 		var a struct {
-			Name     string
-			Message  *string
-			Every    *string
-			Calendar *string
-			Enabled  *bool
+			Name string
+			loopSpec
 		}
 		if err := json.Unmarshal(args, &a); err != nil {
 			return "", err
 		}
-		l, err := updateLoop(a.Name, a.Message, a.Every, a.Calendar, a.Enabled)
+		l, err := updateLoop(a.Name, a.loopSpec)
 		if err != nil {
 			return "", err
 		}
@@ -321,4 +332,14 @@ func scheduleDesc(l *Loop) string {
 		return "calendar: " + l.Calendar
 	}
 	return "every " + l.Every
+}
+
+// timeoutDesc renders the effective command timeout, including the default the
+// loop never had to spell out.
+func timeoutDesc(l *Loop) string {
+	d, err := parseTimeout(l.Timeout)
+	if err != nil {
+		return l.Timeout
+	}
+	return d.String()
 }

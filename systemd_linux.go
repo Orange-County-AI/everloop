@@ -93,13 +93,26 @@ func installUnits(l *Loop) error {
 		envLines += fmt.Sprintf("Environment=EVERLOOP_DATA_DIR=%s\n", d)
 	}
 
+	// A command loop must outlive systemd's default TimeoutStartSec (90s) long
+	// enough to enforce its OWN timeout and spool the failure report. If systemd
+	// killed the tick first, a hung command would fail exactly the way the
+	// historical PATH bug did: invisibly.
+	var svcLines string
+	if l.Command != "" {
+		d, err := parseTimeout(l.Timeout)
+		if err != nil {
+			return err
+		}
+		svcLines = fmt.Sprintf("TimeoutStartSec=%ds\n", int(d.Seconds())+30)
+	}
+
 	service := fmt.Sprintf(`[Unit]
 Description=everloop tick: %s%s
 
 [Service]
 Type=oneshot
-%sExecStart=%s tick %s
-`, instanceLabel(), l.Name, envLines, bin, l.Name)
+%s%sExecStart=%s tick %s
+`, instanceLabel(), l.Name, envLines, svcLines, bin, l.Name)
 
 	timer := fmt.Sprintf(`[Unit]
 Description=everloop timer: %s%s
