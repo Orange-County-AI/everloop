@@ -1,7 +1,8 @@
 package main
 
 // Sink tests: envelope rendering, opencode session resolve + prompt_async
-// injection, hermes V2 HMAC signing + idempotency header.
+// injection, hermes V2 HMAC signing + idempotency header, and the herdr sink's
+// argv construction against a fake `herdr` binary.
 
 import (
 	"crypto/hmac"
@@ -11,6 +12,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -163,6 +167,215 @@ func TestHermesSinkRequiresURL(t *testing.T) {
 	t.Setenv("HERMES_WEBHOOK_URL", "")
 	if _, err := newSink("tincan", nil); err == nil {
 		t.Fatal("expected error without HERMES_WEBHOOK_URL")
+	}
+}
+
+// --- herdr -------------------------------------------------------------------
+
+// argSep separates the recorded arguments in the fake binary's log. A plain
+// newline would not do: the envelope contains newlines, and the whole point of
+// these tests is proving it arrives as ONE argv element rather than several.
+const argSep = "<<<ARGSEP>>>"
+
+// fakeHerdr writes a stand-in `herdr` into a temp dir and points the sink at
+// it. It records its own argv and the two env vars the real CLI resolves its
+// server with, then exits $FAKE_HERDR_EXIT after writing $FAKE_HERDR_STDERR.
+// Returned: the script path, and readers for the argv and env it saw.
+func fakeHerdr(t *testing.T) (bin string, argv func() []string, childEnv func() string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake herdr is a /bin/sh script")
+	}
+	dir := t.TempDir()
+	bin = filepath.Join(dir, "herdr")
+	argvLog := filepath.Join(dir, "argv")
+	envLog := filepath.Join(dir, "env")
+	script := `#!/bin/sh
+: > "$FAKE_HERDR_ARGV"
+for a in "$@"; do printf '%s` + argSep + `' "$a" >> "$FAKE_HERDR_ARGV"; done
+printf 'HERDR_SOCKET_PATH=%s\nHERDR_SESSION=%s\n' "$HERDR_SOCKET_PATH" "$HERDR_SESSION" > "$FAKE_HERDR_ENV"
+[ -n "$FAKE_HERDR_STDERR" ] && printf '%s' "$FAKE_HERDR_STDERR" >&2
+exit "${FAKE_HERDR_EXIT:-0}"
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_HERDR_ARGV", argvLog)
+	t.Setenv("FAKE_HERDR_ENV", envLog)
+
+	argv = func() []string {
+		t.Helper()
+		b, err := os.ReadFile(argvLog)
+		if err != nil {
+			t.Fatalf("fake herdr never ran: %v", err)
+		}
+		parts := strings.Split(string(b), argSep)
+		return parts[:len(parts)-1] // trailing separator
+	}
+	childEnv = func() string {
+		t.Helper()
+		b, err := os.ReadFile(envLog)
+		if err != nil {
+			t.Fatalf("fake herdr never ran: %v", err)
+		}
+		return string(b)
+	}
+	return bin, argv, childEnv
+}
+
+func TestHerdrSinkExecsAgentPromptWithEnvelopeAsOneArg(t *testing.T) {
+	bin, argv, _ := fakeHerdr(t)
+
+	s := &herdrSink{bin: bin, target: "clem", timeoutMS: 120000, source: "everloop"}
+	if err := s.deliver("reconcile the ledger", map[string]string{"kind": "tick", "loop": "recon", "event_id": "abc"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := argv()
+	want := []string{
+		"agent", "prompt", "clem",
+		envelope("everloop", "reconcile the ledger", map[string]string{"kind": "tick", "loop": "recon", "event_id": "abc"}),
+		"--wait", "--timeout", "120000",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("argv length = %d, want %d: %q", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("argv[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	// The envelope is multi-line; landing as one element is the whole claim.
+	if !strings.Contains(got[3], "\n") || !strings.HasPrefix(got[3], `<channel source="everloop" `) {
+		t.Fatalf("envelope arg = %q", got[3])
+	}
+}
+
+func TestHerdrSinkNonZeroExitReturnsErrorWithStderrCode(t *testing.T) {
+	bin, _, _ := fakeHerdr(t)
+	t.Setenv("FAKE_HERDR_EXIT", "1")
+	t.Setenv("FAKE_HERDR_STDERR", `{"error":{"code":"agent_not_found","message":"agent target clem not found"},"id":"cli:agent:prompt"}`)
+
+	s := &herdrSink{bin: bin, target: "clem", timeoutMS: 5000, source: "everloop"}
+	err := s.deliver("ping", map[string]string{"kind": "tick"})
+	if err == nil {
+		// A nil here would ack the message; the spool would drop a tick that
+		// never reached an agent.
+		t.Fatal("expected an error so the message stays claimed for the next poll")
+	}
+	if !strings.Contains(err.Error(), "agent_not_found") {
+		t.Fatalf("error should carry herdr's stderr JSON, got: %v", err)
+	}
+}
+
+func TestHerdrSinkMissingBinaryIsAnError(t *testing.T) {
+	s := &herdrSink{bin: filepath.Join(t.TempDir(), "definitely-not-here"), target: "clem", timeoutMS: 1000, source: "everloop"}
+	if err := s.deliver("ping", nil); err == nil {
+		t.Fatal("expected an error when the herdr binary does not exist")
+	}
+}
+
+func TestHerdrSinkPassesHerdrEnvThrough(t *testing.T) {
+	bin, _, childEnv := fakeHerdr(t)
+	t.Setenv("HERDR_SOCKET_PATH", "/run/user/1000/herdr/test.sock")
+	t.Setenv("HERDR_SESSION", "titan")
+
+	s := &herdrSink{bin: bin, target: "clem", timeoutMS: 1000, source: "everloop"}
+	if err := s.deliver("ping", nil); err != nil {
+		t.Fatal(err)
+	}
+	got := childEnv()
+	if !strings.Contains(got, "HERDR_SOCKET_PATH=/run/user/1000/herdr/test.sock") ||
+		!strings.Contains(got, "HERDR_SESSION=titan") {
+		t.Fatalf("herdr env did not reach the CLI untouched: %q", got)
+	}
+}
+
+func TestHerdrSinkDoesNotGoThroughAShell(t *testing.T) {
+	bin, argv, _ := fakeHerdr(t)
+	sentinel := filepath.Join(t.TempDir(), "pwned")
+	hostile := "look; touch " + sentinel + " && echo $(whoami) `id` \"quoted\""
+
+	s := &herdrSink{bin: bin, target: "clem", timeoutMS: 1000, source: "everloop"}
+	if err := s.deliver(hostile, map[string]string{"kind": "message"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Fatal("content was interpreted by a shell")
+	}
+	if got := argv()[3]; !strings.Contains(got, hostile) {
+		t.Fatalf("content mangled in transit: %q", got)
+	}
+}
+
+func TestNewSinkHerdrRequiresTarget(t *testing.T) {
+	t.Setenv("CHANNEL_SINK", "herdr")
+	t.Setenv("HERDR_TARGET", "")
+	if _, err := newSink("everloop", nil); err == nil {
+		t.Fatal("expected an error without HERDR_TARGET")
+	}
+}
+
+func TestNewSinkHerdrDefaults(t *testing.T) {
+	t.Setenv("CHANNEL_SINK", "herdr")
+	t.Setenv("HERDR_TARGET", "clem")
+	t.Setenv("HERDR_BIN", "")
+	t.Setenv("HERDR_PROMPT_TIMEOUT_MS", "")
+
+	dlv, err := newSink("everloop", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, ok := dlv.(*herdrSink)
+	if !ok {
+		t.Fatalf("sink = %T, want *herdrSink", dlv)
+	}
+	if s.bin != "herdr" || s.target != "clem" || s.timeoutMS != 120000 || s.source != "everloop" {
+		t.Fatalf("defaults wrong: %+v", *s)
+	}
+}
+
+func TestNewSinkHerdrHonorsBinAndTimeout(t *testing.T) {
+	t.Setenv("CHANNEL_SINK", "herdr")
+	t.Setenv("HERDR_TARGET", "ws/agent")
+	t.Setenv("HERDR_BIN", "/opt/herdr/bin/herdr")
+	t.Setenv("HERDR_PROMPT_TIMEOUT_MS", "45000")
+
+	dlv, err := newSink("everloop", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := dlv.(*herdrSink)
+	if s.bin != "/opt/herdr/bin/herdr" || s.timeoutMS != 45000 {
+		t.Fatalf("bin=%q timeout=%d", s.bin, s.timeoutMS)
+	}
+}
+
+func TestNewSinkHerdrRejectsBadTimeout(t *testing.T) {
+	t.Setenv("CHANNEL_SINK", "herdr")
+	t.Setenv("HERDR_TARGET", "clem")
+	for _, v := range []string{"soon", "0", "-1", "12.5"} {
+		t.Setenv("HERDR_PROMPT_TIMEOUT_MS", v)
+		if _, err := newSink("everloop", nil); err == nil {
+			// Falling back to the default would look like a slow agent, with
+			// nothing saying the setting never took.
+			t.Fatalf("HERDR_PROMPT_TIMEOUT_MS=%q was accepted", v)
+		}
+	}
+}
+
+// The fake binary resolved off PATH, i.e. exactly what the "herdr" default
+// means at delivery time rather than at construction time.
+func TestHerdrSinkResolvesBinFromPATH(t *testing.T) {
+	bin, argv, _ := fakeHerdr(t)
+	t.Setenv("PATH", filepath.Dir(bin)+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	s := &herdrSink{bin: "herdr", target: "clem", timeoutMS: 1000, source: "everloop"}
+	if err := s.deliver("ping", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := argv(); len(got) != 7 || got[0] != "agent" {
+		t.Fatalf("argv = %q", got)
 	}
 }
 
