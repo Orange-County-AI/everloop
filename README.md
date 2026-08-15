@@ -369,7 +369,7 @@ Reconcile the ledger and report anomalies.
 Everything above the last hop — the OS timers, the spool, claim → ack,
 coalescing — is harness-agnostic; only the default MCP-channel push is
 Claude-Code-specific. The last hop is a pluggable **sink**
-(`CHANNEL_SINK=claude|opencode|hermes`, default claude), shared with
+(`CHANNEL_SINK=claude|opencode|hermes|herdr`, default claude), shared with
 [tincan](../tincan). Events always arrive wrapped in the same
 `<channel source="everloop" ...>` envelope, so agent instructions are
 portable across harnesses, and delivery through any sink keeps the
@@ -416,6 +416,63 @@ repeats for 1h, which pairs with the spool's at-least-once redelivery. Each
 event spawns a run; hermes has no persistent session to inject into. The
 payload is `{"body": "<channel ...>...</channel>", "meta": {...}}`, so the
 route's prompt template is just `{body}`.
+
+**herdr** — targets an agent [herdr](https://herdr.dev) is driving in a pane.
+Each event is delivered by exec'ing the CLI:
+
+```
+herdr agent prompt $HERDR_TARGET '<channel source="everloop" ...>…</channel>' --wait --timeout N
+```
+
+built as an argv slice through `os/exec` — **never a shell string**, so an
+envelope carrying `$(...)`, backticks, quotes or newlines is passed through as
+one literal argument. herdr types into the terminal, so this sink is
+model-agnostic: whatever agent is in that pane receives the tick, with no
+harness-specific notification plane in the path — and so no
+`--dangerously-load-development-channels` gate, which the default `claude` sink
+depends on.
+
+| env | default | |
+|---|---|---|
+| `HERDR_TARGET` | *(required)* | the agent target — pane id, agent name, or workspace/tab path |
+| `HERDR_BIN` | `herdr` | resolved off `PATH` at delivery time |
+| `HERDR_PROMPT_TIMEOUT_MS` | `120000` | the `--wait --timeout` bound, in milliseconds; a non-numeric or non-positive value is refused at startup rather than silently defaulted |
+
+`HERDR_SOCKET_PATH` and `HERDR_SESSION` are **inherited untouched** — the CLI
+resolves the server and session with them natively, and everloop deliberately
+does not re-implement that. The exec is additionally bounded at
+`--timeout + 30s`: the drain loop is single-threaded, and herdr can block
+before its own deadline applies if the socket is gone.
+
+**Ack semantics, precisely.** Exit 0 acks; a non-zero exit returns an error, so
+the message stays claimed and the spool redelivers it next poll (with herdr's
+stderr JSON — `{"error":{"code":"agent_not_found"…}}` — carried in the error, so
+the log names the cause). The caveat worth stating outright: exit 0 means herdr
+submitted the prompt and observed a **settled lifecycle state, which includes
+`blocked`** (the agent stopped on a permission prompt). That is evidence the
+tick was *delivered*, not proof it was *processed*. everloop's design already
+tolerates exactly this — ticks coalesce, so a firing the agent parked on is
+carried forward in the next event's `coalesced_count` rather than lost, and
+at-least-once was never a promise that the agent acted. It is the same standing
+the default `claude` sink has always had, where the MCP notification is
+fire-and-forget and nothing confirms it was read.
+
+```jsonc
+// .mcp.json — everloop delivering into a herdr-driven pane
+{
+  "mcpServers": {
+    "everloop": {
+      "command": "everloop",
+      "args": ["serve"],
+      "env": {
+        "EVERLOOP_INSTANCE": "clem",
+        "CHANNEL_SINK": "herdr",
+        "HERDR_TARGET": "clem"
+      }
+    }
+  }
+}
+```
 
 ## Notes & semantics
 
