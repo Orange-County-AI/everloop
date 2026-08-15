@@ -12,6 +12,10 @@ package main
 //	hermes             POST {HERMES_WEBHOOK_URL} — a Hermes webhook route (V2
 //	                   HMAC); each event spawns a run (Hermes has no persistent
 //	                   session to inject into)
+//	herdr              exec `herdr agent prompt {HERDR_TARGET} <envelope>
+//	                   --wait --timeout N` — types the event into whatever agent
+//	                   herdr is driving in that pane, so the transport is
+//	                   model-agnostic (no harness-specific plane to depend on)
 //
 // Non-claude sinks wrap the message in the same `<channel ...meta>content
 // </channel>` envelope Claude Code produces, so the server's instructions text
@@ -21,6 +25,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -29,6 +34,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -76,8 +82,30 @@ func newSink(source string, out *stdoutWriter) (sink, error) {
 			source: source,
 			client: &http.Client{Timeout: 15 * time.Second},
 		}, nil
+	case "herdr":
+		target := os.Getenv("HERDR_TARGET")
+		if target == "" {
+			return nil, fmt.Errorf("CHANNEL_SINK=herdr requires HERDR_TARGET (a herdr agent target: pane id, agent name, or workspace/tab path)")
+		}
+		timeoutMS := herdrDefaultTimeoutMS
+		if v := os.Getenv("HERDR_PROMPT_TIMEOUT_MS"); v != "" {
+			// Refuse a bad value rather than quietly falling back: a typo here
+			// would otherwise wait two minutes per event and look like a slow
+			// agent, with nothing saying the setting never took.
+			n, err := strconv.Atoi(strings.TrimSpace(v))
+			if err != nil || n < 1 {
+				return nil, fmt.Errorf("invalid HERDR_PROMPT_TIMEOUT_MS %q: want a positive integer (milliseconds)", v)
+			}
+			timeoutMS = n
+		}
+		return &herdrSink{
+			bin:       envOr("HERDR_BIN", "herdr"),
+			target:    target,
+			timeoutMS: timeoutMS,
+			source:    source,
+		}, nil
 	default:
-		return nil, fmt.Errorf("unknown CHANNEL_SINK %q: want claude|opencode|hermes", os.Getenv("CHANNEL_SINK"))
+		return nil, fmt.Errorf("unknown CHANNEL_SINK %q: want claude|opencode|hermes|herdr", os.Getenv("CHANNEL_SINK"))
 	}
 }
 
@@ -293,4 +321,86 @@ func (s *hermesSink) deliver(content string, meta map[string]string) error {
 		return fmt.Errorf("hermes webhook: HTTP %d: %s", res.StatusCode, strings.TrimSpace(string(snippet)))
 	}
 	return nil
+}
+
+// --- herdr: exec the CLI, which types the event into the agent's pane --------
+
+// herdrSink delivers by running `herdr agent prompt <target> <envelope>`. herdr
+// drives the agent at the terminal, so the transport says nothing about which
+// model is on the other end — the point of this sink, versus the claude one's
+// dependency on a harness-specific notification plane.
+//
+// The command is built as an argv slice and handed to os/exec directly: there
+// is no shell anywhere on this path, so an envelope carrying `$(...)`, quotes,
+// backticks or newlines is passed through as one literal argument.
+type herdrSink struct {
+	bin       string
+	target    string
+	timeoutMS int
+	source    string
+}
+
+// herdrDefaultTimeoutMS is what `--wait` gets when HERDR_PROMPT_TIMEOUT_MS is
+// unset: long enough for an agent to finish a real turn, short enough that a
+// wedged one does not hold the drain loop past the next few polls.
+const herdrDefaultTimeoutMS = 120000
+
+// herdrHardStopGrace bounds the *process* past herdr's own --wait deadline. If
+// the socket is gone or the server is not answering, herdr can block before its
+// timeout ever applies, and drainLoop is single-threaded — one wedged delivery
+// stalls every message behind it. Same shape as the systemd units'
+// TimeoutStartSec = timeout + 30s: the inner deadline is the real one, this is
+// only the cover for it not firing.
+const herdrHardStopGrace = 30 * time.Second
+
+func (s *herdrSink) deliver(content string, meta map[string]string) error {
+	text := envelope(s.source, content, meta)
+	// --timeout is refused by herdr without --wait, so the two travel together.
+	args := []string{"agent", "prompt", s.target, text, "--wait", "--timeout", strconv.Itoa(s.timeoutMS)}
+
+	ctx, cancel := context.WithTimeout(context.Background(),
+		time.Duration(s.timeoutMS)*time.Millisecond+herdrHardStopGrace)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, s.bin, args...)
+	// cmd.Env stays nil, i.e. os.Environ(): HERDR_SOCKET_PATH and HERDR_SESSION
+	// reach the CLI untouched and it resolves the server and session with them
+	// natively. Reading them here to rebuild that resolution would be a second
+	// copy of it, free to drift from the one that actually decides.
+	var stderr bytes.Buffer
+	cmd.Stdout = io.Discard
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err == nil {
+		// Exit 0 means herdr submitted the prompt and observed a settled
+		// lifecycle state — which includes *blocked* (the agent stopped on a
+		// permission prompt), not only idle/done. So this is evidence the tick
+		// was delivered, not proof it was processed. Acking anyway is the same
+		// standing the claude sink has always had (a fire-and-forget
+		// notification nothing confirms was read), and everloop's design
+		// already absorbs it: ticks coalesce, so the next delivery carries the
+		// catch-up count rather than the work being lost.
+		return nil
+	}
+	// Anything else leaves the message claimed-but-unacked: the spool reclaims
+	// it on the next poll and drainLoop stops the batch here to preserve order.
+	detail := strings.TrimSpace(stderr.String())
+	if len(detail) > 300 {
+		detail = detail[:300]
+	}
+	// herdr reports failures as JSON on stderr ({"error":{"code":...}}), which
+	// names the cause — agent_not_found, agent_prompt_stalled, timeout — where
+	// the exit status alone says only "non-zero".
+	if ctx.Err() != nil {
+		return fmt.Errorf("herdr agent prompt: killed after %s%s", time.Duration(s.timeoutMS)*time.Millisecond+herdrHardStopGrace, herdrDetail(detail))
+	}
+	return fmt.Errorf("herdr agent prompt: %v%s", err, herdrDetail(detail))
+}
+
+func herdrDetail(detail string) string {
+	if detail == "" {
+		return ""
+	}
+	return ": " + detail
 }
