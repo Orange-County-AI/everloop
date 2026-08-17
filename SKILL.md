@@ -1,7 +1,7 @@
 ---
 name: everloop
 description: >
-  Manage persistent Claude Code loops — recurring instructions that never expire
+  Manage persistent agent loops — recurring instructions that never expire
   and survive session restarts and reboots, with no external service. They are
   scheduled outside the session by whatever the host has: systemd user timers, a
   launchd agent, or everloop's own scheduler daemon on a box (or container) with
@@ -12,12 +12,16 @@ description: >
   or push an ad-hoc message into a listening session.
 ---
 
-# everloop — persistent loops for Claude Code
+# everloop — persistent loops for a coding agent
 
-everloop replaces the built-in `/loop` (whose CronCreate schedule expires after
-~7 days) by moving the schedule **out of the session** and into something that
-outlives it, so a recurring instruction fires forever — across session restarts
-and reboots — with no external service.
+everloop replaces a harness's in-session scheduler (Claude Code's `/loop` expires
+after ~7 days; codex and omp have none) by moving the schedule **out of the
+session** and into something that outlives it, so a recurring instruction fires
+forever — across session restarts and reboots — with no external service.
+
+Delivery is **herdr's unix socket, and only that**: herdr submits each firing as
+ordinary session input to whatever agent is in the target pane, so everloop is
+the same on claude, codex, omp, opencode and pi.
 
 What does the scheduling is picked at runtime: systemd user timers on Linux,
 launchd agents on macOS, and everloop's own `everloop scheduler` daemon where
@@ -33,11 +37,11 @@ on all three; only calendar expressions differ, and only by being a subset.
 
 One Go binary, four roles:
 
-- `everloop serve` — the MCP **channel** server Claude Code spawns over stdio.
-  Declares `claude/channel`, drains the spool every ~2s, and pushes each firing
-  into the session as `<channel source="everloop" ...>`. Also exposes the loop
-  management tools below. It never schedules anything — if it did, loops would
-  die with the session, which is the whole problem everloop solves.
+- `everloop serve` — the MCP server the agent spawns over stdio. It drains the
+  spool every ~2s and submits each firing through herdr's `agent.prompt` as
+  `<channel source="everloop" ...>`, and exposes the loop management tools
+  below. It never schedules anything — if it did, loops would die with the
+  session, which is the whole problem everloop solves.
 - `everloop scheduler` — the supervised daemon that fires loops where systemd
   and launchd are unavailable. One per data dir; logs to stdout; a missed
   window catches up exactly once. Not needed when systemd is doing the work.
@@ -150,21 +154,28 @@ cron syntax like `17 * * * *` is not OnCalendar and will be rejected.
 
 ## Connecting a session to receive firings
 
-Loops only *deliver* into a session running the channel server. Register it in
-the project's `.mcp.json` (an example ships in the repo) or `~/.claude.json`:
+Loops only *deliver* into a session running `everloop serve`. Register it in the
+harness's project config — `.omp/mcp.json` for omp, `.mcp.json` for
+claude/codex — naming the instance and the herdr target:
 
 ```json
-{ "mcpServers": { "everloop": { "command": "/home/stephan/.local/bin/everloop", "args": ["serve"] } } }
+{ "mcpServers": { "everloop": { "command": "/home/stephan/.local/bin/everloop", "args": ["serve"],
+  "env": { "EVERLOOP_INSTANCE": "clem", "HERDR_TARGET": "clem" } } } }
 ```
 
-Channels are a research preview, so launch with the development flag:
+`HERDR_TARGET` is required and should be the agent's **herdr name**, not a pane
+id: a name survives a restart, a pane id dies with the pane. No launch flag is
+needed on any harness — there is no channel plane to enable, because herdr
+delivers the event as session input.
 
-```bash
-claude --dangerously-load-development-channels server:everloop
-```
+A tick only lands while the agent is alive: `agent.prompt` answers
+`agent_not_found` when the pane holds no agent, and the message stays queued.
+That is what makes a `--message` loop safe as a liveness heartbeat and a
+`--command` loop unsafe for one — the latter runs in the timer, without the
+agent.
 
 On connect, the server drains any backlog first (the reconnect/replay path),
-then polls. Run one listening session per queue — two `serve` processes would
+then polls. Run one draining session per queue — two `serve` processes would
 race for the same spool.
 
 ## Notes
@@ -176,7 +187,7 @@ race for the same spool.
   `OnCalendar` with `Persistent=true` (catches a missed wall-clock fire up at
   boot). The portable scheduler reproduces both, including the catch-up.
 - Local-only, no network listener: anything that can run `everloop send` as the
-  user can put text in front of Claude — same trust boundary as the shell.
+  user can put text in front of the agent — same trust boundary as the shell.
 - `EVERLOOP_DATA_DIR` overrides state location; `EVERLOOP_POLL_SECONDS` the spool
   poll; `EVERLOOP_SCAN_SECONDS` the portable scheduler's scan.
 - **Instances**: `EVERLOOP_INSTANCE=<name>` isolates a session's loops into

@@ -1,36 +1,43 @@
 # everloop
 
-Persistent loops for Claude Code, scheduled **outside the session** — by
+Persistent loops for a coding agent, scheduled **outside the session** — by
 systemd user timers, launchd agents, or everloop's own scheduler daemon where
 there is no init system to borrow (containers). No external service, no
 expiration.
 
-Claude Code's built-in `/loop` (CronCreate) expires after 7 days. everloop
-moves the schedule out of the session and into something that outlives it. On
-Linux each loop is normally a `.timer`/`.service` pair under
-`~/.config/systemd/user/`; on macOS a LaunchAgent plist under
-`~/Library/LaunchAgents/`; in a container with no systemd, a row of state that
-`everloop scheduler` acts on. Either way it survives session restarts and
-machine reboots, and (on Linux, with linger enabled) fires even while you're
-logged out.
+A harness's own scheduler is tied to its session (Claude Code's `/loop` expires
+after 7 days; codex and omp have no equivalent at all). everloop moves the
+schedule out of the session and into something that outlives it. On Linux each
+loop is normally a `.timer`/`.service` pair under `~/.config/systemd/user/`; on
+macOS a LaunchAgent plist under `~/Library/LaunchAgents/`; in a container with no
+systemd, a row of state that `everloop scheduler` acts on. Either way it
+survives session restarts and machine reboots, and (on Linux, with linger
+enabled) fires even while you're logged out.
 
 ## How it works
 
 ```
 timer / scheduler ──▶ everloop tick NAME ──▶ ~/.local/share/everloop/queue/
                                                        │
-Claude Code ◀── notifications/claude/channel ◀── everloop serve (MCP channel)
+   the agent's session ◀── herdr agent.prompt ◀── everloop serve (drain loop)
 ```
+
+**Delivery goes through [herdr](https://herdr.dev)'s unix socket, and that is the
+only transport.** herdr already drives the pane the agent lives in — claude,
+codex, omp, opencode, pi — so a tick arrives as ordinary session input and
+everloop needs no per-harness plane of its own. That is what makes `serve`
+harness-agnostic: not a menu of sinks, but a transport that does not care which
+model is on the other end. Set `HERDR_TARGET` to the agent's herdr name;
+`CHANNEL_SINK=none` turns delivery off for a checkout that should only expose
+tools.
 
 One static Go binary, four roles:
 
-- **`everloop serve`** — the MCP channel server Claude Code spawns over stdio.
-  It declares the `claude/channel` capability, polls the spool every 2s, and
-  pushes each message into the session as a `<channel source="everloop" ...>`
-  event. It also exposes MCP tools (`create_loop`, `list_loops`,
-  `update_loop`, `delete_loop`, `send_message`) so Claude can manage loops
-  from inside the session. It never schedules anything — see
-  [Backends](#backends-systemd-launchd-portable).
+- **`everloop serve`** — the MCP server the agent spawns over stdio. It exposes
+  the loop tools (`create_loop`, `list_loops`, `update_loop`, `delete_loop`,
+  `send_message`) so the agent can manage its own loops, and runs the drain
+  loop that submits each spooled message to herdr. It never schedules
+  anything — see [Backends](#backends-systemd-launchd-portable).
 - **`everloop scheduler`** — the supervised daemon that fires loops when the
   portable backend is live. Not needed when systemd or launchd is doing the
   scheduling.
@@ -44,11 +51,17 @@ One static Go binary, four roles:
   MCP tools, so loops can be managed from any shell and any process can push
   a message into the session with `everloop send`.
 
-Delivery is **at-least-once**: messages are claimed (renamed), notified, then
+Delivery is **at-least-once**: messages are claimed (renamed), submitted, then
 acked (deleted), so a crash mid-delivery redelivers. Each event carries an
 `event_id` meta attribute to use as an idempotency key. Ticks that fire while
 no session is listening wait in the spool and are drained — coalesced — the
 moment a session reconnects.
+
+**A tick therefore only lands while the agent is alive.** `agent.prompt` fails
+with `agent_not_found` when nothing is in the pane, and the message stays
+claimed for the next poll. That is what lets a liveness heartbeat be a loop: a
+`--message` loop cannot ping on behalf of a dead session, while a `--command`
+loop runs in the timer and would.
 
 ## Install
 
@@ -56,25 +69,27 @@ moment a session reconnects.
 go build -o ~/.local/bin/everloop .
 ```
 
-Register the channel server in `.mcp.json` (project) or `~/.claude.json`
-(user, use the absolute path):
+Register it as an MCP server in the harness's project config — `.omp/mcp.json`
+for omp, `.mcp.json` for claude/codex — with the target it should deliver to:
 
 ```json
 {
   "mcpServers": {
     "everloop": {
       "command": "/home/stephan/.local/bin/everloop",
-      "args": ["serve"]
+      "args": ["serve"],
+      "env": {
+        "EVERLOOP_INSTANCE": "clem",
+        "HERDR_TARGET": "clem"
+      }
     }
   }
 }
 ```
 
-Channels are a research preview, so launch with the development flag:
-
-```bash
-claude --dangerously-load-development-channels server:everloop
-```
+No launch flag is needed on any harness. Delivery does not use a harness channel
+plane; herdr submits the event as session input, so there is nothing to enable
+and nothing to opt into.
 
 For loops to fire while you're logged out (Linux, systemd backend), enable
 linger once:
@@ -144,9 +159,9 @@ second, and `everloop scheduler` can be restarted at any time without losing
 one.
 
 **Scheduling deliberately does not live in `everloop serve`.** That process is a
-child of the agent's Claude Code session, so loops scheduled there would die
-with the session — exactly the `/loop` and `CronCreate` failure mode everloop
-was built to fix. `serve` warns on stderr if it starts with the portable backend
+child of the agent's session, so loops scheduled there would die with the
+session — exactly the in-session-scheduler failure mode everloop was built to
+fix. `serve` warns on stderr if it starts with the portable backend
 live and nothing scheduling.
 
 ### What the portable backend has to keep that systemd kept for us
@@ -192,7 +207,7 @@ that parses but can never occur (`*-02-30`) is refused for the same reason.
 
 ## Usage
 
-From inside a session, just ask Claude — the tools are self-describing:
+From inside a session, just ask the agent — the tools are self-describing:
 
 > set a loop that reconciles the ledger every hour
 
@@ -364,109 +379,68 @@ Reconcile the ledger and report anomalies.
   is failing rather than reporting. The body is a diagnostic, not an
   instruction.
 
-## Other harnesses (`CHANNEL_SINK`)
+## Delivery (`CHANNEL_SINK`)
 
 Everything above the last hop — the OS timers, the spool, claim → ack,
-coalescing — is harness-agnostic; only the default MCP-channel push is
-Claude-Code-specific. The last hop is a pluggable **sink**
-(`CHANNEL_SINK=claude|opencode|hermes|herdr`, default claude), shared with
-[tincan](../tincan). Events always arrive wrapped in the same
-`<channel source="everloop" ...>` envelope, so agent instructions are
-portable across harnesses, and delivery through any sink keeps the
-at-least-once contract: a failed delivery leaves the message claimed and it
-is retried next poll, in order.
+coalescing — never cared which harness was listening. The last hop now does not
+either: it is **herdr's unix socket**, and it is the only transport. Events
+arrive wrapped in a `<channel source="everloop" ...>` envelope, so one set of
+agent instructions is correct everywhere.
 
-Mount `everloop serve` as an MCP server in the harness with the sink envs
-set — one process then does both directions (the harness gets the
-`create_loop` / `send_message` / etc. tools over stdio, and the drain loop
-injects inbound events over HTTP). `CHANNEL_SINK=none` gives a tools-only
-serve (no draining) for deployments where a separate process owns delivery.
-
-**OpenCode** — targets a live [`opencode serve`](https://opencode.ai/docs/server/)
-(`OPENCODE_URL`, default `http://127.0.0.1:4096`); each event becomes a user
-turn via `POST /session/{id}/prompt_async`. The session is resolved by title
-(`OPENCODE_SESSION_TITLE`, scoped by `OPENCODE_DIRECTORY`) — found or created
-on first delivery, re-resolved if it vanishes — or pinned with
-`OPENCODE_SESSION_ID`. Basic auth follows opencode's own
-`OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD`.
-
-```jsonc
-// opencode.json — one process: tools + injection
-{
-  "mcp": {
-    "everloop": {
-      "type": "local",
-      "command": ["everloop", "serve"],
-      "environment": {
-        "EVERLOOP_INSTANCE": "clem",
-        "CHANNEL_SINK": "opencode",
-        "OPENCODE_SESSION_TITLE": "clem"
-      }
-    }
-  }
-}
-```
-
-**Hermes** — targets a [hermes gateway webhook route](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/webhooks)
-(`HERMES_WEBHOOK_URL`, e.g. `http://127.0.0.1:8644/webhooks/everloop`), one
-POST per event, signed with the route's Generic V2 secret
-(`HERMES_WEBHOOK_SECRET`; HMAC-SHA256 of `<timestamp>.<body>`) and
-deduplicated by an `X-Request-ID` of `everloop-<event_id>` — hermes drops
-repeats for 1h, which pairs with the spool's at-least-once redelivery. Each
-event spawns a run; hermes has no persistent session to inject into. The
-payload is `{"body": "<channel ...>...</channel>", "meta": {...}}`, so the
-route's prompt template is just `{body}`.
-
-**herdr** — targets an agent [herdr](https://herdr.dev) is driving in a pane.
-Each event is delivered by exec'ing the CLI:
-
-```
-herdr agent prompt $HERDR_TARGET '<channel source="everloop" ...>…</channel>' --wait --timeout N
-```
-
-built as an argv slice through `os/exec` — **never a shell string**, so an
-envelope carrying `$(...)`, backticks, quotes or newlines is passed through as
-one literal argument. herdr types into the terminal, so this sink is
-model-agnostic: whatever agent is in that pane receives the tick, with no
-harness-specific notification plane in the path — and so no
-`--dangerously-load-development-channels` gate, which the default `claude` sink
-depends on.
+Mount `everloop serve` as an MCP server in the harness with the two envs set —
+one process then does both directions: the harness gets the `create_loop` /
+`send_message` / etc. tools over stdio, and the drain loop submits inbound
+events over the socket.
 
 | env | default | |
 |---|---|---|
-| `HERDR_TARGET` | *(required)* | the agent target — pane id, agent name, or workspace/tab path |
-| `HERDR_BIN` | `herdr` | resolved off `PATH` at delivery time |
-| `HERDR_PROMPT_TIMEOUT_MS` | `120000` | the `--wait --timeout` bound, in milliseconds; a non-numeric or non-positive value is refused at startup rather than silently defaulted |
+| `CHANNEL_SINK` | `herdr` | `herdr` delivers; `none` (or `tools`) exposes the tools and never drains, for a checkout or a deployment where something else owns delivery. Any other value is refused at startup. |
+| `HERDR_TARGET` | *(required)* | the agent's herdr target. Prefer the **agent name** — a pane id dies with the pane, a name survives a restart. |
+| `HERDR_PROMPT_TIMEOUT_MS` | `120000` | the wait bound in milliseconds; a non-numeric or non-positive value is refused at startup rather than silently defaulted |
+| `HERDR_SOCKET_PATH` / `HERDR_SESSION` | `~/.config/herdr/herdr.sock` | same precedence the CLI uses: explicit path, then session, then the default socket |
+| `EVERLOOP_HERDR_PROTOCOL_ALLOW` | *(empty)* | extra accepted protocol versions, comma-separated. 19 and 20 are accepted without it; an unparseable token is ignored rather than fatal, because a typo here must not stop delivery on eight boxes at once |
 
-`HERDR_SOCKET_PATH` and `HERDR_SESSION` are **inherited untouched** — the CLI
-resolves the server and session with them natively, and everloop deliberately
-does not re-implement that. The exec is additionally bounded at
-`--timeout + 30s`: the drain loop is single-threaded, and herdr can block
-before its own deadline applies if the socket is gone.
+The call is `agent.prompt` with `wait.until = [idle, done, blocked]`, over
+newline-delimited JSON. A `ping` on its own connection checks the protocol
+first, so an unaccepted server is never sent an operation.
 
-**Ack semantics, precisely.** Exit 0 acks; a non-zero exit returns an error, so
-the message stays claimed and the spool redelivers it next poll (with herdr's
-stderr JSON — `{"error":{"code":"agent_not_found"…}}` — carried in the error, so
-the log names the cause). The caveat worth stating outright: exit 0 means herdr
-submitted the prompt and observed a **settled lifecycle state, which includes
-`blocked`** (the agent stopped on a permission prompt). That is evidence the
-tick was *delivered*, not proof it was *processed*. everloop's design already
-tolerates exactly this — ticks coalesce, so a firing the agent parked on is
-carried forward in the next event's `coalesced_count` rather than lost, and
-at-least-once was never a promise that the agent acted. It is the same standing
-the default `claude` sink has always had, where the MCP notification is
-fire-and-forget and nothing confirms it was read.
+**Why a socket and not the CLI.** This used to exec
+`herdr agent prompt … --wait --timeout N`, which worked and could not do three
+things. A non-zero exit says only "non-zero", so a missing agent
+(`agent_not_found` — fix `HERDR_TARGET`) was indistinguishable from an
+unreachable herdr (delivery outcome unknown); the two now stay apart, and only
+the second is a reason to suspect the transport. `agent_prompt_stalled` is
+recoverable and recovery needs several calls with a proof step between them
+(below), which one exec cannot express. And it spawned a process per tick for a
+socket already open to us.
+
+**Ack semantics, precisely.** A submitted prompt acks; any failure returns an
+error, so the message stays claimed and the spool redelivers it next poll, in
+order. The caveat worth stating outright: herdr reports a **settled lifecycle
+state, which includes `blocked`** (the agent stopped on a permission prompt).
+That is evidence the tick was *delivered*, not proof it was *processed*.
+everloop's design already tolerates exactly this — ticks coalesce, so a firing
+the agent parked on is carried into the next event's `coalesced_count` rather
+than lost, and at-least-once was never a promise that the agent acted.
+
+**The stalled-paste recovery.** Measured on omp: a large bracketed paste can
+collapse into an attachment chip and absorb herdr's submit key, so herdr answers
+`agent_prompt_stalled` for a prompt that is sitting in the composer. everloop
+resolves the pane, records its `state_change_seq`, sends one `Enter`, and polls
+for ~15s. Only if that sequence **moves** does it wait for the agent to settle
+and ack. Accepting the keypress proves nothing, so when the sequence does not
+move the original stall is reported rather than a success nobody observed.
 
 ```jsonc
-// .mcp.json — everloop delivering into a herdr-driven pane
+// .omp/mcp.json — everloop delivering into a herdr-driven pane
 {
   "mcpServers": {
     "everloop": {
+      "type": "stdio",
       "command": "everloop",
       "args": ["serve"],
       "env": {
         "EVERLOOP_INSTANCE": "clem",
-        "CHANNEL_SINK": "herdr",
         "HERDR_TARGET": "clem"
       }
     }
@@ -512,10 +486,10 @@ fire-and-forget and nothing confirms it was read.
   defaults to `/usr/bin:/bin:/usr/sbin:/sbin`, so absolute paths matter more,
   not less. Failure damping state lives in
   `~/.local/share/everloop/state/<loop>.json` everywhere.
-- **Security**: the channel is local-only — no network listener. Anything
-  that can run `everloop send` as your user can put text in front of Claude,
-  which is the same trust boundary as your shell.
-- **One session per instance**: like all channels, run one listening session
+- **Security**: delivery is local-only — a unix socket, no network listener.
+  Anything that can run `everloop send` as your user can put text in front of
+  the agent, which is the same trust boundary as your shell.
+- **One session per instance**: run one draining session
   per queue. Two concurrent `serve` processes sharing a spool would race for it
   (each message still goes to exactly one of them). To run **several**
   independent orchestrators at once, give each its own instance. Under the
@@ -524,7 +498,7 @@ fire-and-forget and nothing confirms it was read.
 
 ## Multiple instances (`EVERLOOP_INSTANCE`)
 
-Several long-lived sessions (e.g. distinct Claude Code orchestrators) can each
+Several long-lived sessions (e.g. one orchestrator per org) can each
 own their own loops by setting `EVERLOOP_INSTANCE=<name>` on the `serve`
 process. An instance gets:
 

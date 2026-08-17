@@ -11,18 +11,21 @@ import (
 )
 
 // Hand-rolled MCP server over stdio (newline-delimited JSON-RPC 2.0).
-// We implement the protocol directly rather than via an SDK because the
-// channel contract needs a custom capability (claude/channel) and a custom
-// notification method, and because it keeps the binary dependency-free.
+// We implement the protocol directly rather than via an SDK to keep the binary
+// dependency-free; the tools below are ordinary MCP and work on any harness.
+//
+// Nothing here is Claude-specific any more. Events do not arrive as an MCP
+// notification at all — herdr submits them as session input (see sink.go), so
+// this server's only job is the loop-management tools plus the spool drain.
 
-const serverInstructions = "Events from the everloop channel arrive as " +
-	`<channel source="everloop" kind="tick|message" ...>. ` +
+const serverInstructions = "Events from the everloop channel are delivered into this session as " +
+	`<channel source="everloop" kind="tick|message" ...> by herdr, as ordinary input rather than as an MCP notification. ` +
 	`kind="tick" is a persistent scheduled loop firing: perform the instruction in the body. ` +
 	`If coalesced_count is greater than 1, the loop fired that many times while no session was listening - catch up ONCE, do not repeat the work N times. ` +
 	`A command loop's body is its command's output instead: coalesced_count is how many firings produced output, each shown under its own "[everloop] run N of M" header in the order it happened - handle every one, they are different events, not repeats. ` +
 	`status="error" or status="timeout" means the loop's command is failing rather than reporting: the body is a diagnostic, not an instruction. Failures are damped (1st, 2nd, 4th, 8th... consecutive), so one report can stand for many silent failures. ` +
 	`kind="message" is an ad-hoc message pushed from the "everloop send" CLI by the operator or another process. ` +
-	"The channel is one-way: act on events, no reply expected. " +
+	"Delivery is one-way: act on events, no reply expected. " +
 	"Manage loops with the create_loop / list_loops / update_loop / delete_loop tools; loops are scheduled outside this session (a systemd user timer, a launchd agent, or the everloop scheduler daemon) and never expire."
 
 type rpcRequest struct {
@@ -56,10 +59,6 @@ func (w *stdoutWriter) error(id json.RawMessage, code int, msg string) {
 	w.write(map[string]any{"jsonrpc": "2.0", "id": id, "error": rpcError{Code: code, Message: msg}})
 }
 
-func (w *stdoutWriter) notify(method string, params any) {
-	w.write(map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
-}
-
 func pollInterval() time.Duration {
 	if s := os.Getenv("EVERLOOP_POLL_SECONDS"); s != "" {
 		if n, err := strconv.Atoi(s); err == nil && n >= 1 {
@@ -75,7 +74,7 @@ func serve() error {
 	}
 	warnIfNoScheduler()
 	out := &stdoutWriter{enc: json.NewEncoder(os.Stdout)}
-	dlv, err := newSink("everloop", out)
+	dlv, err := newSink("everloop")
 	if err != nil {
 		return err
 	}
@@ -109,8 +108,9 @@ func serve() error {
 			out.result(req.ID, map[string]any{
 				"protocolVersion": p.ProtocolVersion,
 				"capabilities": map[string]any{
-					"experimental": map[string]any{"claude/channel": map[string]any{}},
-					"tools":        map[string]any{},
+					// No experimental channel capability: this server no longer
+					// pushes notifications of any kind, on any harness.
+					"tools": map[string]any{},
 				},
 				"serverInfo":   map[string]any{"name": "everloop", "version": version},
 				"instructions": serverInstructions,

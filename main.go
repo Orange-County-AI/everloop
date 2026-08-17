@@ -1,9 +1,13 @@
-// everloop: persistent loops for Claude Code, backed by whichever scheduler the
-// host actually has — systemd user timers, launchd agents, or everloop's own
+// everloop: persistent loops for a coding agent, backed by whichever scheduler
+// the host actually has — systemd user timers, launchd agents, or everloop's own
 // scheduler daemon where there is no init system to borrow (containers).
 //
+// Delivery is herdr's unix socket and nothing else, so the agent on the other
+// end can be claude, codex, omp, opencode or pi — see sink.go.
+//
 // One binary, four roles:
-//   - `everloop serve`      the MCP channel server Claude Code spawns (stdio)
+//   - `everloop serve`      the MCP server the agent spawns (stdio), which also
+//     drains the spool into herdr
 //   - `everloop scheduler`  the supervised daemon that fires loops when the
 //     portable backend is live (see backend.go for the choice)
 //   - `everloop tick NAME`  one firing, spooled: what a timer executes
@@ -18,11 +22,11 @@ import (
 
 const version = "0.1.0"
 
-const usage = `everloop %s - persistent loops for Claude Code
+const usage = `everloop %s - persistent loops for a coding agent
 (systemd user timers, launchd agents, or everloop's own scheduler daemon)
 
 Usage:
-  everloop serve                                 run as MCP channel server (stdio)
+  everloop serve                                 run as MCP server + spool drain (stdio)
   everloop scheduler                             run the loop scheduler (portable backend; supervise this)
   everloop create NAME (--message M | --command C) (--every D | --calendar C) [--timeout T] [--disabled]
   everloop list
