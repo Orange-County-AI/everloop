@@ -19,9 +19,13 @@ after ~7 days; codex and omp have none) by moving the schedule **out of the
 session** and into something that outlives it, so a recurring instruction fires
 forever — across session restarts and reboots — with no external service.
 
-Delivery is **herdr's unix socket, and only that**: herdr submits each firing as
-ordinary session input to whatever agent is in the target pane, so everloop is
-the same on claude, codex, omp, opencode and pi.
+Delivery is a **unix socket**, and which one is `CHANNEL_SINK`. By default it is
+**herdr's**: herdr submits each firing as ordinary session input to whatever
+agent is in the target pane, so everloop is the same on claude, codex, omp,
+opencode and pi. `CHANNEL_SINK=transit` opts in to the local **Transit**
+daemon's IPC socket instead, which puts the delivery in the Transit ledger and
+gives it an idempotency id the agent settles explicitly. herdr is still the
+default and the fleet has not cut over.
 
 What does the scheduling is picked at runtime: systemd user timers on Linux,
 launchd agents on macOS, and everloop's own `everloop scheduler` daemon where
@@ -38,7 +42,7 @@ on all three; only calendar expressions differ, and only by being a subset.
 One Go binary, four roles:
 
 - `everloop serve` — the MCP server the agent spawns over stdio. It drains the
-  spool every ~2s and submits each firing through herdr's `agent.prompt` as
+  spool every ~2s and submits each firing to the configured sink as
   `<channel source="everloop" ...>`, and exposes the loop management tools
   below. It never schedules anything — if it did, loops would die with the
   session, which is the whole problem everloop solves.
@@ -168,9 +172,27 @@ id: a name survives a restart, a pane id dies with the pane. No launch flag is
 needed on any harness — there is no channel plane to enable, because herdr
 delivers the event as session input.
 
-A tick only lands while the agent is alive: `agent.prompt` answers
-`agent_not_found` when the pane holds no agent, and the message stays queued.
-That is what makes a `--message` loop safe as a liveness heartbeat and a
+To deliver over Transit instead, set `CHANNEL_SINK=transit` and `TRANSIT_TARGET`
+(a Transit address: `name`, `name@host` or `#room`) in place of `HERDR_TARGET`:
+
+```json
+{ "mcpServers": { "everloop": { "command": "/home/stephan/.local/bin/everloop", "args": ["serve"],
+  "env": { "EVERLOOP_INSTANCE": "clem", "CHANNEL_SINK": "transit", "TRANSIT_TARGET": "clem@titan" } } } }
+```
+
+`TRANSIT_TARGET` is required the same way `HERDR_TARGET` is: absent, the sink
+refuses at startup rather than guessing. everloop hands the daemon a body and
+the daemon renders the `transit/1` envelope, so the channel envelope arrives
+inside a transit one and the meta contract is unchanged. Optional knobs:
+`TRANSIT_SEND_TIMEOUT_MS` (default 45000) and `TRANSIT_SOCKET` /
+`TRANSIT_DATA_DIR`. **This is an added transport, not a cutover — herdr is still
+the default and the fleet has not moved.** Any other `CHANNEL_SINK` value is
+refused at startup; `none` (or `tools`) exposes the tools and never drains.
+
+A tick only lands while the agent is alive. On herdr, `agent.prompt` answers
+`agent_not_found` when the pane holds no agent; on transit the daemon refuses a
+target with no local session with the same code. Either way the message stays
+queued. That is what makes a `--message` loop safe as a liveness heartbeat and a
 `--command` loop unsafe for one — the latter runs in the timer, without the
 agent.
 
