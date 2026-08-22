@@ -19,22 +19,25 @@ enabled) fires even while you're logged out.
 ```
 timer / scheduler ──▶ everloop tick NAME ──▶ ~/.local/share/everloop/queue/
                                                        │
-   the agent's session ◀── herdr agent.prompt ◀── everloop serve (drain loop)
-                        ◀── transit op:"send" ◀──┘
+   the agent's session ◀── transit op:"send" ◀── everloop serve (drain loop)
+                        ◀── herdr agent.prompt ◀──┘
 ```
 
-**Delivery is a unix socket either way.** By default it is
-[herdr](https://herdr.dev)'s: herdr drives the pane the agent lives in — claude,
-codex, omp, opencode, pi — so a tick arrives as ordinary session input and
-everloop needs no per-harness plane of its own. `CHANNEL_SINK=transit` opts in
-to the local [Transit](https://github.com/Orange-County-AI/transit) daemon's IPC
-socket instead, which puts the delivery in the Transit ledger and gives it an
-idempotency id the agent settles explicitly. herdr remains the default and the
-fleet has not cut over. Either way `serve` stays harness-agnostic: not a menu of
-per-model planes, but two transports that do not care which model is on the
-other end. Set `HERDR_TARGET` (or `TRANSIT_TARGET`) to the agent to deliver to;
+**Delivery is a unix socket either way.** By default it is the local
+[Transit](https://github.com/Orange-County-AI/transit) daemon's: the delivery
+lands in the Transit ledger and carries an idempotency id the agent settles
+explicitly, so a firing is auditable from the same place as everything else on
+the mesh. Set `TRANSIT_TARGET` to the agent's Transit address.
+
+`CHANNEL_SINK=herdr` selects [herdr](https://herdr.dev)'s socket instead, which
+is still fully supported — a box with no Transit daemon, or an agent herdr still
+owns, sets that plus `HERDR_TARGET` and behaves exactly as before.
 `CHANNEL_SINK=none` turns delivery off for a checkout that should only expose
 tools.
+
+Either way `serve` stays harness-agnostic: not a menu of per-model planes, but
+two transports that do not care which model is on the other end — claude, codex,
+omp, opencode, pi.
 
 One static Go binary, four roles:
 
@@ -86,15 +89,16 @@ for omp, `.mcp.json` for claude/codex — with the target it should deliver to:
       "args": ["serve"],
       "env": {
         "EVERLOOP_INSTANCE": "clem",
-        "HERDR_TARGET": "clem"
+        "TRANSIT_TARGET": "clem@titan"
       }
     }
   }
 }
 ```
 
-To deliver over Transit instead, opt in explicitly — `CHANNEL_SINK` is unset in
-the example above, which selects herdr:
+To stay on herdr, say so — the default is transit, so `HERDR_TARGET` alone is no
+longer a complete config and `serve` refuses at startup rather than picking a
+transport for you:
 
 ```json
 {
@@ -104,8 +108,8 @@ the example above, which selects herdr:
       "args": ["serve"],
       "env": {
         "EVERLOOP_INSTANCE": "clem",
-        "CHANNEL_SINK": "transit",
-        "TRANSIT_TARGET": "clem@titan"
+        "CHANNEL_SINK": "herdr",
+        "HERDR_TARGET": "clem"
       }
     }
   }
@@ -113,9 +117,9 @@ the example above, which selects herdr:
 ```
 
 No launch flag is needed on any harness on either transport. Delivery does not
-use a harness channel plane: herdr submits the event as session input, and
-Transit's daemon injects it through whichever adapter already owns the target.
-There is nothing to enable and nothing to opt into beyond `CHANNEL_SINK`.
+use a harness channel plane: Transit's daemon injects the event through
+whichever adapter already owns the target, and herdr submits it as session
+input. There is nothing to enable and nothing to opt into beyond `CHANNEL_SINK`.
 
 For loops to fire while you're logged out (Linux, systemd backend), enable
 linger once:
@@ -415,87 +419,38 @@ instructions is correct everywhere.
 
 | `CHANNEL_SINK` | what happens |
 |---|---|
-| unset / `herdr` | **default.** `agent.prompt` over herdr's unix socket. |
-| `transit` | `op:"send"` over the local Transit daemon's IPC socket. Opt-in. |
+| unset / `transit` | **default.** `op:"send"` over the local Transit daemon's IPC socket. |
+| `herdr` | `agent.prompt` over herdr's unix socket. Still fully supported. |
 | `none` / `tools` | exposes the tools and never drains, for a checkout or a deployment where something else owns delivery. |
 
 Any other value is refused at startup rather than falling back to a transport.
+
+**The default flipped from `herdr` to `transit`.** A config written before that
+— `HERDR_TARGET` set, `CHANNEL_SINK` unset — used to be complete and now is not:
+`serve` refuses at startup and names both remedies (add `TRANSIT_TARGET`, or set
+`CHANNEL_SINK=herdr`). It does **not** quietly fall back to herdr. An implicit
+transport chosen by whichever env var happens to be set is the silent guess this
+whole mechanism refuses to make, and a box that stayed on herdr without saying
+so would be exactly the ledger blind spot the new default closes.
 
 Mount `everloop serve` as an MCP server in the harness with the envs set — one
 process then does both directions: the harness gets the `create_loop` /
 `send_message` / etc. tools over stdio, and the drain loop submits inbound
 events over the socket.
 
-### `CHANNEL_SINK=herdr` (default)
+### `CHANNEL_SINK=transit` (default)
 
-| env | default | |
-|---|---|---|
-| `HERDR_TARGET` | *(required)* | the agent's herdr target. Prefer the **agent name** — a pane id dies with the pane, a name survives a restart. |
-| `HERDR_PROMPT_TIMEOUT_MS` | `120000` | the wait bound in milliseconds; a non-numeric or non-positive value is refused at startup rather than silently defaulted |
-| `HERDR_SOCKET_PATH` / `HERDR_SESSION` | `~/.config/herdr/herdr.sock` | same precedence the CLI uses: explicit path, then session, then the default socket |
-| `EVERLOOP_HERDR_PROTOCOL_ALLOW` | *(empty)* | extra accepted protocol versions, comma-separated. 19 and 20 are accepted without it; an unparseable token is ignored rather than fatal, because a typo here must not stop delivery on eight boxes at once |
+Delivers through the local
+[Transit](https://github.com/Orange-County-AI/transit) daemon. This is the
+default; `herdr` below is still fully supported and is one env var away.
 
-The call is `agent.prompt` with `wait.until = [idle, done, blocked]`, over
-newline-delimited JSON. A `ping` on its own connection checks the protocol
-first, so an unaccepted server is never sent an operation.
-
-**Why a socket and not the CLI.** This used to exec
-`herdr agent prompt … --wait --timeout N`, which worked and could not do three
-things. A non-zero exit says only "non-zero", so a missing agent
-(`agent_not_found` — fix `HERDR_TARGET`) was indistinguishable from an
-unreachable herdr (delivery outcome unknown); the two now stay apart, and only
-the second is a reason to suspect the transport. `agent_prompt_stalled` is
-recoverable and recovery needs several calls with a proof step between them
-(below), which one exec cannot express. And it spawned a process per tick for a
-socket already open to us.
-
-**Ack semantics, precisely.** A submitted prompt acks; any failure returns an
-error, so the message stays claimed and the spool redelivers it next poll, in
-order. The caveat worth stating outright: herdr reports a **settled lifecycle
-state, which includes `blocked`** (the agent stopped on a permission prompt).
-That is evidence the tick was *delivered*, not proof it was *processed*.
-everloop's design already tolerates exactly this — ticks coalesce, so a firing
-the agent parked on is carried into the next event's `coalesced_count` rather
-than lost, and at-least-once was never a promise that the agent acted.
-
-**The stalled-paste recovery.** Measured on omp: a large bracketed paste can
-collapse into an attachment chip and absorb herdr's submit key, so herdr answers
-`agent_prompt_stalled` for a prompt that is sitting in the composer. everloop
-resolves the pane, records its `state_change_seq`, sends one `Enter`, and polls
-for ~15s. Only if that sequence **moves** does it wait for the agent to settle
-and ack. Accepting the keypress proves nothing, so when the sequence does not
-move the original stall is reported rather than a success nobody observed.
-
-```jsonc
-// .omp/mcp.json — everloop delivering into a herdr-driven pane
-{
-  "mcpServers": {
-    "everloop": {
-      "type": "stdio",
-      "command": "everloop",
-      "args": ["serve"],
-      "env": {
-        "EVERLOOP_INSTANCE": "clem",
-        "HERDR_TARGET": "clem"
-      }
-    }
-  }
-}
-```
-
-### `CHANNEL_SINK=transit`
-
-Opt-in. Delivers through the local
-[Transit](https://github.com/Orange-County-AI/transit) daemon instead of herdr.
-**This is an added transport during a migration, not a cutover: herdr is still
-the default and the fleet has not moved.**
-
-Two things it buys. The delivery lands in the **Transit ledger**, so anything
-audited from the ledger — a census, an outage sweep — can see everloop's
-traffic; a delivery outside the ledger is a blind spot in exactly the place one
-recently cost the fleet 28 unnoticed minutes. And the message carries a Transit
-**idempotency id with explicit settlement**, so a redelivery is recognisable to
-the agent rather than a second identical paste.
+Two things it buys, and they are why it is the default. The delivery lands in
+the **Transit ledger**, so anything audited from the ledger — a census, an
+outage sweep — can see everloop's traffic; a delivery outside the ledger is a
+blind spot in exactly the place one recently cost the fleet 28 unnoticed
+minutes, and everloop was the last herdr-only delivery path left. And the
+message carries a Transit **idempotency id with explicit settlement**, so a
+redelivery is recognisable to the agent rather than a second identical paste.
 
 | env | default | |
 |---|---|---|
@@ -550,7 +505,7 @@ to fit with everloop's usual `[everloop] output truncated, N bytes dropped]`
 marker. A dropped tail is visible in the body, never silent.
 
 ```jsonc
-// .omp/mcp.json — everloop delivering over Transit
+// .omp/mcp.json — everloop delivering over Transit (the default: no CHANNEL_SINK)
 {
   "mcpServers": {
     "everloop": {
@@ -559,8 +514,69 @@ marker. A dropped tail is visible in the body, never silent.
       "args": ["serve"],
       "env": {
         "EVERLOOP_INSTANCE": "clem",
-        "CHANNEL_SINK": "transit",
         "TRANSIT_TARGET": "clem@titan"
+      }
+    }
+  }
+}
+```
+
+### `CHANNEL_SINK=herdr`
+
+Still fully supported, and unchanged: a box with no Transit daemon, or an agent
+herdr still owns, sets `CHANNEL_SINK=herdr` and behaves exactly as it did
+before the default moved.
+
+| env | default | |
+|---|---|---|
+| `HERDR_TARGET` | *(required)* | the agent's herdr target. Prefer the **agent name** — a pane id dies with the pane, a name survives a restart. |
+| `HERDR_PROMPT_TIMEOUT_MS` | `120000` | the wait bound in milliseconds; a non-numeric or non-positive value is refused at startup rather than silently defaulted |
+| `HERDR_SOCKET_PATH` / `HERDR_SESSION` | `~/.config/herdr/herdr.sock` | same precedence the CLI uses: explicit path, then session, then the default socket |
+| `EVERLOOP_HERDR_PROTOCOL_ALLOW` | *(empty)* | extra accepted protocol versions, comma-separated. 19 and 20 are accepted without it; an unparseable token is ignored rather than fatal, because a typo here must not stop delivery on eight boxes at once |
+
+The call is `agent.prompt` with `wait.until = [idle, done, blocked]`, over
+newline-delimited JSON. A `ping` on its own connection checks the protocol
+first, so an unaccepted server is never sent an operation.
+
+**Why a socket and not the CLI.** This used to exec
+`herdr agent prompt … --wait --timeout N`, which worked and could not do three
+things. A non-zero exit says only "non-zero", so a missing agent
+(`agent_not_found` — fix `HERDR_TARGET`) was indistinguishable from an
+unreachable herdr (delivery outcome unknown); the two now stay apart, and only
+the second is a reason to suspect the transport. `agent_prompt_stalled` is
+recoverable and recovery needs several calls with a proof step between them
+(below), which one exec cannot express. And it spawned a process per tick for a
+socket already open to us.
+
+**Ack semantics, precisely.** A submitted prompt acks; any failure returns an
+error, so the message stays claimed and the spool redelivers it next poll, in
+order. The caveat worth stating outright: herdr reports a **settled lifecycle
+state, which includes `blocked`** (the agent stopped on a permission prompt).
+That is evidence the tick was *delivered*, not proof it was *processed*.
+everloop's design already tolerates exactly this — ticks coalesce, so a firing
+the agent parked on is carried into the next event's `coalesced_count` rather
+than lost, and at-least-once was never a promise that the agent acted.
+
+**The stalled-paste recovery.** Measured on omp: a large bracketed paste can
+collapse into an attachment chip and absorb herdr's submit key, so herdr answers
+`agent_prompt_stalled` for a prompt that is sitting in the composer. everloop
+resolves the pane, records its `state_change_seq`, sends one `Enter`, and polls
+for ~15s. Only if that sequence **moves** does it wait for the agent to settle
+and ack. Accepting the keypress proves nothing, so when the sequence does not
+move the original stall is reported rather than a success nobody observed.
+
+```jsonc
+// .omp/mcp.json — everloop delivering into a herdr-driven pane
+{
+  "mcpServers": {
+    "everloop": {
+      "type": "stdio",
+      "command": "everloop",
+      "args": ["serve"],
+      "env": {
+        "EVERLOOP_INSTANCE": "clem",
+        "CHANNEL_SINK": "herdr",
+        "HERDR_TARGET": "clem"
       }
     }
   }

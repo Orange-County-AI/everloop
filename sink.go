@@ -4,13 +4,20 @@ package main
 //
 // CHANNEL_SINK selects the transport:
 //
-//	herdr  (default) agent.prompt over herdr's unix socket — see herdr_socket.go
-//	transit          op:"send" over the local Transit daemon's IPC socket —
-//	                 see transit_socket.go. Opt-in, during the fleet's
-//	                 migration off herdr; herdr stays the default.
-//	none             tools-only serve: no draining, no presence. Pair with a
-//	                 standalone pump that owns delivery ("tools" works too), or
-//	                 use it for a dev checkout that should never deliver.
+//	transit  (default) op:"send" over the local Transit daemon's IPC socket —
+//	                   see transit_socket.go
+//	herdr              agent.prompt over herdr's unix socket — see
+//	                   herdr_socket.go. Still fully supported: a box without a
+//	                   Transit daemon, or one whose agent herdr still owns,
+//	                   sets this and nothing changes for it.
+//	none               tools-only serve: no draining, no presence. Pair with a
+//	                   standalone pump that owns delivery ("tools" works too),
+//	                   or use it for a dev checkout that should never deliver.
+//
+// Transit is the default because a delivery outside its ledger is invisible to
+// anything audited from the ledger, and everloop was the last herdr-only
+// delivery path on the fleet. It also brings an idempotency id and explicit
+// settlement, which the herdr path has no equivalent for.
 //
 // Both transports are harness-agnostic, and neither is a per-harness plane.
 // herdr types the event into whatever agent is in the pane — claude, codex,
@@ -27,6 +34,14 @@ package main
 // is what the server's instructions text tells the agent to expect. On the
 // transit transport that envelope is the *body* of a `transit/1` envelope the
 // daemon renders — everloop does not render transit/1 itself.
+//
+// THE DEFAULT FLIPPED, and a config that predates the flip — HERDR_TARGET set,
+// CHANNEL_SINK unset — used to be complete and now is not. Such a config
+// refuses at startup with both remedies named rather than falling back to
+// herdr: an implicit transport chosen by which env var happens to be set is
+// the silent guess this whole file exists to refuse, and a box that quietly
+// stayed on herdr would be exactly the ledger blind spot the default moved to
+// close.
 //
 // A delivery failure leaves the message claimed-but-unacked, so the spool's
 // at-least-once reclaim retries it, in order, on the next poll.
@@ -49,8 +64,35 @@ type sink interface {
 // newSink picks delivery from env. `source` is the channel name that goes in the
 // envelope ("tincan" / "everloop").
 func newSink(source string) (sink, error) {
-	switch strings.ToLower(os.Getenv("CHANNEL_SINK")) {
-	case "", "herdr":
+	requested := strings.ToLower(strings.TrimSpace(os.Getenv("CHANNEL_SINK")))
+	switch requested {
+	case "", "transit":
+		// The target is required for the same reason HERDR_TARGET is: Transit
+		// would otherwise need everloop to guess an address, and a wrong guess
+		// delivers into someone else's session rather than failing.
+		target := os.Getenv("TRANSIT_TARGET")
+		if target == "" {
+			return nil, missingTransitTarget(requested == "")
+		}
+		timeoutMS := transitDefaultTimeoutMS
+		if v := os.Getenv("TRANSIT_SEND_TIMEOUT_MS"); v != "" {
+			n, err := strconv.Atoi(strings.TrimSpace(v))
+			if err != nil || n < 1 {
+				return nil, fmt.Errorf("invalid TRANSIT_SEND_TIMEOUT_MS %q: want a positive integer (milliseconds)", v)
+			}
+			timeoutMS = n
+		}
+		driver, err := newTransitSocketDriver(transitSocketOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("transit sink: %w", err)
+		}
+		return &transitSink{
+			driver:  driver,
+			target:  target,
+			timeout: time.Duration(timeoutMS) * time.Millisecond,
+			source:  source,
+		}, nil
+	case "herdr":
 		target := os.Getenv("HERDR_TARGET")
 		if target == "" {
 			// Refuse rather than guess. A pane id would be available from
@@ -81,39 +123,31 @@ func newSink(source string) (sink, error) {
 			timeout: time.Duration(timeoutMS) * time.Millisecond,
 			source:  source,
 		}, nil
-	case "transit":
-		// The target is required for the same reason HERDR_TARGET is: Transit
-		// would otherwise need everloop to guess an address, and a wrong guess
-		// delivers into someone else's session rather than failing.
-		target := os.Getenv("TRANSIT_TARGET")
-		if target == "" {
-			return nil, fmt.Errorf("CHANNEL_SINK=transit requires TRANSIT_TARGET (a Transit address: name, name@host, or #room)")
-		}
-		timeoutMS := transitDefaultTimeoutMS
-		if v := os.Getenv("TRANSIT_SEND_TIMEOUT_MS"); v != "" {
-			n, err := strconv.Atoi(strings.TrimSpace(v))
-			if err != nil || n < 1 {
-				return nil, fmt.Errorf("invalid TRANSIT_SEND_TIMEOUT_MS %q: want a positive integer (milliseconds)", v)
-			}
-			timeoutMS = n
-		}
-		driver, err := newTransitSocketDriver(transitSocketOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("transit sink: %w", err)
-		}
-		return &transitSink{
-			driver:  driver,
-			target:  target,
-			timeout: time.Duration(timeoutMS) * time.Millisecond,
-			source:  source,
-		}, nil
 	case "none", "tools":
 		// Tools-only: serve exposes the loop tools but never drains (and never
 		// heartbeats presence) — something else owns delivery. Without this,
 		// mounting serve beside a pump would ack messages twice.
 		return nil, nil
 	default:
-		return nil, fmt.Errorf("unknown CHANNEL_SINK %q: want herdr (default), transit or none", os.Getenv("CHANNEL_SINK"))
+		return nil, fmt.Errorf("unknown CHANNEL_SINK %q: want transit (default), herdr or none", os.Getenv("CHANNEL_SINK"))
+	}
+}
+
+// missingTransitTarget refuses, and says how to fix it. A deployment that
+// predates the default flip arrives here with CHANNEL_SINK unset and
+// HERDR_TARGET set — a config that used to be complete — so that case gets
+// both remedies by name. Quietly using herdr for it instead would be the
+// implicit transport this file refuses to pick, and it would leave the box in
+// exactly the ledger blind spot the new default closes.
+func missingTransitTarget(byDefault bool) error {
+	const address = "TRANSIT_TARGET (a Transit address: name, name@host, or #room)"
+	switch {
+	case !byDefault:
+		return fmt.Errorf("CHANNEL_SINK=transit requires %s", address)
+	case os.Getenv("HERDR_TARGET") != "":
+		return fmt.Errorf("CHANNEL_SINK is unset and now defaults to transit, which requires %s. HERDR_TARGET is set, so this config predates the change: either add TRANSIT_TARGET to move this session onto Transit, or set CHANNEL_SINK=herdr to keep the previous transport", address)
+	default:
+		return fmt.Errorf("CHANNEL_SINK is unset and defaults to transit, which requires %s. Set CHANNEL_SINK=herdr for the herdr transport, or CHANNEL_SINK=none for a tools-only serve", address)
 	}
 }
 

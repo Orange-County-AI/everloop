@@ -26,7 +26,7 @@ const serverInstructions = "Events from the everloop channel are delivered into 
 	`status="error" or status="timeout" means the loop's command is failing rather than reporting: the body is a diagnostic, not an instruction. Failures are damped (1st, 2nd, 4th, 8th... consecutive), so one report can stand for many silent failures. ` +
 	`kind="message" is an ad-hoc message pushed from the "everloop send" CLI by the operator or another process. ` +
 	"Delivery is one-way: act on events, no reply expected. " +
-	`On the Transit transport the channel envelope arrives inside a transit/1 envelope, whose "from" is the session everloop runs in - it is still a one-way everloop event, so do NOT reply to it. ` +
+	`On the default Transit transport the channel envelope arrives inside a transit/1 envelope, whose "from" is the session everloop runs in - it is still a one-way everloop event, so do NOT reply to it. ` +
 	"Manage loops with the create_loop / list_loops / update_loop / delete_loop tools; loops are scheduled outside this session (a systemd user timer, a launchd agent, or the everloop scheduler daemon) and never expire."
 
 type rpcRequest struct {

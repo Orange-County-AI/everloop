@@ -256,48 +256,84 @@ func TestTransitBodyClampsWhenContentCannotShrinkEnough(t *testing.T) {
 func TestNewSinkTransitRequiresTarget(t *testing.T) {
 	t.Setenv("CHANNEL_SINK", "transit")
 	t.Setenv("TRANSIT_TARGET", "")
+	t.Setenv("HERDR_TARGET", "")
 	t.Setenv("TRANSIT_SOCKET", filepath.Join(t.TempDir(), "t.sock"))
 	if _, err := newSink("everloop"); err == nil || !strings.Contains(err.Error(), "TRANSIT_TARGET") {
 		t.Fatalf("transit sink must refuse without a target, got %v", err)
 	}
 }
 
-func TestNewSinkTransitIsOptIn(t *testing.T) {
+// A config written before the default flipped — HERDR_TARGET set, CHANNEL_SINK
+// unset — used to be complete. It must refuse loudly and name both remedies,
+// not quietly fall back to the transport whose env var happens to be set.
+func TestNewSinkDefaultRefusesAPreFlipHerdrConfig(t *testing.T) {
+	t.Setenv("CHANNEL_SINK", "")
+	t.Setenv("TRANSIT_TARGET", "")
+	t.Setenv("HERDR_TARGET", "jessica")
+	dlv, err := newSink("everloop")
+	if err == nil {
+		t.Fatalf("an unset CHANNEL_SINK with only HERDR_TARGET must refuse, got %T", dlv)
+	}
+	for _, want := range []string{"defaults to transit", "TRANSIT_TARGET", "CHANNEL_SINK=herdr"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal must mention %q, got %q", want, err)
+		}
+	}
+}
+
+// With neither target set the refusal still has to be actionable.
+func TestNewSinkDefaultRefusesWithNoTargetAtAll(t *testing.T) {
+	t.Setenv("CHANNEL_SINK", "")
+	t.Setenv("TRANSIT_TARGET", "")
+	t.Setenv("HERDR_TARGET", "")
+	_, err := newSink("everloop")
+	if err == nil {
+		t.Fatal("expected a refusal")
+	}
+	for _, want := range []string{"defaults to transit", "TRANSIT_TARGET", "CHANNEL_SINK=herdr"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal must mention %q, got %q", want, err)
+		}
+	}
+}
+
+func TestNewSinkDefaultsToTransit(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "t.sock")
 	t.Setenv("TRANSIT_TARGET", "jessica@titan")
 	t.Setenv("TRANSIT_SOCKET", socket)
+	// HERDR_TARGET being set must not pull the default back to herdr.
 	t.Setenv("HERDR_TARGET", "jessica")
 
-	// Unset and `herdr` both still select herdr: this is an added transport,
-	// not a cutover.
-	for _, value := range []string{"", "herdr"} {
+	// Unset, explicit, and mixed case all select transit.
+	for _, value := range []string{"", "transit", "TRANSIT", " Transit "} {
 		t.Setenv("CHANNEL_SINK", value)
 		dlv, err := newSink("everloop")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, ok := dlv.(*herdrSink); !ok {
-			t.Fatalf("CHANNEL_SINK=%q selected %T, want *herdrSink", value, dlv)
+		s, ok := dlv.(*transitSink)
+		if !ok {
+			t.Fatalf("CHANNEL_SINK=%q selected %T, want *transitSink", value, dlv)
+		}
+		if s.target != "jessica@titan" || s.source != "everloop" {
+			t.Fatalf("target=%q source=%q", s.target, s.source)
+		}
+		if s.timeout != time.Duration(transitDefaultTimeoutMS)*time.Millisecond {
+			t.Fatalf("timeout = %v, want the %dms default", s.timeout, transitDefaultTimeoutMS)
+		}
+		if got := s.driver.(*transitSocketDriver).socketPath(); got != socket {
+			t.Fatalf("socket = %q, want %q", got, socket)
 		}
 	}
 
-	t.Setenv("CHANNEL_SINK", "TRANSIT") // selection is case-insensitive
+	// herdr is still fully supported, explicitly.
+	t.Setenv("CHANNEL_SINK", "herdr")
 	dlv, err := newSink("everloop")
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, ok := dlv.(*transitSink)
-	if !ok {
-		t.Fatalf("CHANNEL_SINK=transit selected %T, want *transitSink", dlv)
-	}
-	if s.target != "jessica@titan" || s.source != "everloop" {
-		t.Fatalf("target=%q source=%q", s.target, s.source)
-	}
-	if s.timeout != time.Duration(transitDefaultTimeoutMS)*time.Millisecond {
-		t.Fatalf("timeout = %v, want the %dms default", s.timeout, transitDefaultTimeoutMS)
-	}
-	if got := s.driver.(*transitSocketDriver).socketPath(); got != socket {
-		t.Fatalf("socket = %q, want %q", got, socket)
+	if _, ok := dlv.(*herdrSink); !ok {
+		t.Fatalf("CHANNEL_SINK=herdr selected %T, want *herdrSink", dlv)
 	}
 }
 

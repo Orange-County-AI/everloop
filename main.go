@@ -2,8 +2,8 @@
 // the host actually has — systemd user timers, launchd agents, or everloop's own
 // scheduler daemon where there is no init system to borrow (containers).
 //
-// Delivery is a unix socket either way — herdr's by default, the local Transit
-// daemon's with CHANNEL_SINK=transit — so the agent on the other end can be
+// Delivery is a unix socket either way — the local Transit daemon's by default,
+// herdr's with CHANNEL_SINK=herdr — so the agent on the other end can be
 // claude, codex, omp, opencode or pi. See sink.go.
 //
 // One binary, four roles:
