@@ -19,25 +19,33 @@ enabled) fires even while you're logged out.
 ```
 timer / scheduler ──▶ everloop tick NAME ──▶ ~/.local/share/everloop/queue/
                                                        │
-   the agent's session ◀── herdr agent.prompt ◀── everloop serve (drain loop)
+   the agent's session ◀── transit op:"send" ◀── everloop serve (drain loop)
+                        ◀── herdr agent.prompt ◀──┘
 ```
 
-**Delivery goes through [herdr](https://herdr.dev)'s unix socket, and that is the
-only transport.** herdr already drives the pane the agent lives in — claude,
-codex, omp, opencode, pi — so a tick arrives as ordinary session input and
-everloop needs no per-harness plane of its own. That is what makes `serve`
-harness-agnostic: not a menu of sinks, but a transport that does not care which
-model is on the other end. Set `HERDR_TARGET` to the agent's herdr name;
+**Delivery is a unix socket either way.** By default it is the local
+[Transit](https://github.com/Orange-County-AI/transit) daemon's: the delivery
+lands in the Transit ledger and carries an idempotency id the agent settles
+explicitly, so a firing is auditable from the same place as everything else on
+the mesh. Set `TRANSIT_TARGET` to the agent's Transit address.
+
+`CHANNEL_SINK=herdr` selects [herdr](https://herdr.dev)'s socket instead, which
+is still fully supported — a box with no Transit daemon, or an agent herdr still
+owns, sets that plus `HERDR_TARGET` and behaves exactly as before.
 `CHANNEL_SINK=none` turns delivery off for a checkout that should only expose
 tools.
+
+Either way `serve` stays harness-agnostic: not a menu of per-model planes, but
+two transports that do not care which model is on the other end — claude, codex,
+omp, opencode, pi.
 
 One static Go binary, four roles:
 
 - **`everloop serve`** — the MCP server the agent spawns over stdio. It exposes
   the loop tools (`create_loop`, `list_loops`, `update_loop`, `delete_loop`,
   `send_message`) so the agent can manage its own loops, and runs the drain
-  loop that submits each spooled message to herdr. It never schedules
-  anything — see [Backends](#backends-systemd-launchd-portable).
+  loop that submits each spooled message to the configured sink. It never
+  schedules anything — see [Backends](#backends-systemd-launchd-portable).
 - **`everloop scheduler`** — the supervised daemon that fires loops when the
   portable backend is live. Not needed when systemd or launchd is doing the
   scheduling.
@@ -57,11 +65,12 @@ acked (deleted), so a crash mid-delivery redelivers. Each event carries an
 no session is listening wait in the spool and are drained — coalesced — the
 moment a session reconnects.
 
-**A tick therefore only lands while the agent is alive.** `agent.prompt` fails
-with `agent_not_found` when nothing is in the pane, and the message stays
-claimed for the next poll. That is what lets a liveness heartbeat be a loop: a
-`--message` loop cannot ping on behalf of a dead session, while a `--command`
-loop runs in the timer and would.
+**A tick therefore only lands while the agent is alive.** On herdr,
+`agent.prompt` fails with `agent_not_found` when nothing is in the pane; on
+transit, the daemon refuses a target that resolves to no local session with the
+same code. Either way the message stays claimed for the next poll. That is what
+lets a liveness heartbeat be a loop: a `--message` loop cannot ping on behalf of
+a dead session, while a `--command` loop runs in the timer and would.
 
 ## Install
 
@@ -80,6 +89,26 @@ for omp, `.mcp.json` for claude/codex — with the target it should deliver to:
       "args": ["serve"],
       "env": {
         "EVERLOOP_INSTANCE": "clem",
+        "TRANSIT_TARGET": "clem@titan"
+      }
+    }
+  }
+}
+```
+
+To stay on herdr, say so — the default is transit, so `HERDR_TARGET` alone is no
+longer a complete config and `serve` refuses at startup rather than picking a
+transport for you:
+
+```json
+{
+  "mcpServers": {
+    "everloop": {
+      "command": "/home/stephan/.local/bin/everloop",
+      "args": ["serve"],
+      "env": {
+        "EVERLOOP_INSTANCE": "clem",
+        "CHANNEL_SINK": "herdr",
         "HERDR_TARGET": "clem"
       }
     }
@@ -87,9 +116,10 @@ for omp, `.mcp.json` for claude/codex — with the target it should deliver to:
 }
 ```
 
-No launch flag is needed on any harness. Delivery does not use a harness channel
-plane; herdr submits the event as session input, so there is nothing to enable
-and nothing to opt into.
+No launch flag is needed on any harness on either transport. Delivery does not
+use a harness channel plane: Transit's daemon injects the event through
+whichever adapter already owns the target, and herdr submits it as session
+input. There is nothing to enable and nothing to opt into beyond `CHANNEL_SINK`.
 
 For loops to fire while you're logged out (Linux, systemd backend), enable
 linger once:
@@ -382,19 +412,123 @@ Reconcile the ledger and report anomalies.
 ## Delivery (`CHANNEL_SINK`)
 
 Everything above the last hop — the OS timers, the spool, claim → ack,
-coalescing — never cared which harness was listening. The last hop now does not
-either: it is **herdr's unix socket**, and it is the only transport. Events
-arrive wrapped in a `<channel source="everloop" ...>` envelope, so one set of
-agent instructions is correct everywhere.
+coalescing — never cared which harness was listening, and the last hop does not
+either. There are two transports, both unix sockets, and events arrive wrapped
+in a `<channel source="everloop" ...>` envelope on both, so one set of agent
+instructions is correct everywhere.
 
-Mount `everloop serve` as an MCP server in the harness with the two envs set —
-one process then does both directions: the harness gets the `create_loop` /
+| `CHANNEL_SINK` | what happens |
+|---|---|
+| unset / `transit` | **default.** `op:"send"` over the local Transit daemon's IPC socket. |
+| `herdr` | `agent.prompt` over herdr's unix socket. Still fully supported. |
+| `none` / `tools` | exposes the tools and never drains, for a checkout or a deployment where something else owns delivery. |
+
+Any other value is refused at startup rather than falling back to a transport.
+
+**The default flipped from `herdr` to `transit`.** A config written before that
+— `HERDR_TARGET` set, `CHANNEL_SINK` unset — used to be complete and now is not:
+`serve` refuses at startup and names both remedies (add `TRANSIT_TARGET`, or set
+`CHANNEL_SINK=herdr`). It does **not** quietly fall back to herdr. An implicit
+transport chosen by whichever env var happens to be set is the silent guess this
+whole mechanism refuses to make, and a box that stayed on herdr without saying
+so would be exactly the ledger blind spot the new default closes.
+
+Mount `everloop serve` as an MCP server in the harness with the envs set — one
+process then does both directions: the harness gets the `create_loop` /
 `send_message` / etc. tools over stdio, and the drain loop submits inbound
 events over the socket.
 
+### `CHANNEL_SINK=transit` (default)
+
+Delivers through the local
+[Transit](https://github.com/Orange-County-AI/transit) daemon. This is the
+default; `herdr` below is still fully supported and is one env var away.
+
+Two things it buys, and they are why it is the default. The delivery lands in
+the **Transit ledger**, so anything audited from the ledger — a census, an
+outage sweep — can see everloop's traffic; a delivery outside the ledger is a
+blind spot in exactly the place one recently cost the fleet 28 unnoticed
+minutes, and everloop was the last herdr-only delivery path left. And the
+message carries a Transit **idempotency id with explicit settlement**, so a
+redelivery is recognisable to the agent rather than a second identical paste.
+
 | env | default | |
 |---|---|---|
-| `CHANNEL_SINK` | `herdr` | `herdr` delivers; `none` (or `tools`) exposes the tools and never drains, for a checkout or a deployment where something else owns delivery. Any other value is refused at startup. |
+| `TRANSIT_TARGET` | *(required)* | the Transit address to deliver to: `name`, `name@host`, or `#room`. Absent, the sink refuses at startup rather than guessing an address and delivering into someone else's session. |
+| `TRANSIT_SEND_TIMEOUT_MS` | `45000` | the send bound in milliseconds; a non-numeric or non-positive value is refused at startup. The default is deliberately past the daemon's own bounds — it holds an IPC connection for 35s, and a cross-host send waits up to 10s for the Worker's commit — so everloop never abandons a send the daemon is still completing. |
+| `TRANSIT_SOCKET` / `TRANSIT_DATA_DIR` | `~/.local/share/transit/transit.sock` | same precedence transit itself uses, so the two cannot disagree about where the socket is |
+
+**Why the IPC socket and not the CLI.** There is no `transit send`. Transit's
+CLI dispatches `daemon`, `adapter`, `enroll`, `status`, `inbox`, `pause`, `mcp`,
+`version` and nothing else; the only sending surface it ships is the MCP tool
+`send_message`, which is itself a thin wrapper over `{"op":"send",…}` on this
+same socket. Going through the CLI would mean spawning `transit mcp`, completing
+an MCP handshake over its stdio and calling a tool, to reach a socket everloop
+can dial directly — and it would put a subprocess back on a delivery path the
+herdr sink deliberately cleared, so that a body carrying `$(...)`, quotes,
+backticks or newlines travels as one literal JSON string.
+
+**everloop does not render `transit/1`.** That envelope — attribute order,
+escaping, the 4,000-rune clip with `truncated="1"`, the channel preview rules —
+is produced daemon-side and golden-vector tested in the Transit repo. everloop
+hands over a *body* and lets Transit wrap it, so on this transport the
+`<channel source="everloop" ...>` envelope simply arrives **inside** a
+`transit/1` one and the meta contract is unchanged. A body over 4,000 runes is
+clipped for terminal injection with `truncated="1"`; `read_message` returns the
+rest.
+
+**Sender identity.** Transit derives the sender from the caller, never from the
+request: a herdr pane id, or the pid whose process ancestry reaches a registered
+native adapter. `everloop serve` is a child of the agent's harness process,
+which is that ancestry, so it resolves with `herdr.service` stopped. everloop
+sends `HERDR_PANE_ID` too when it is set — an optional hint, not a dependency.
+The consequence worth knowing: when `serve` runs under the same agent it
+delivers to, the tick's `from` **is that agent** — a self-addressed message.
+everloop cannot mint an `everloop@host` identity of its own; the daemon only
+registers `claude`, `omp`, `pi` and `opencode` adapters.
+
+**Ack semantics, precisely.** `injected`, `committed` and `spooled` all mean
+Transit took custody and owns the retry, so all three ack. Holding the message
+so everloop retries as well is how an agent gets the same tick twice. A
+`spooled`-with-warning custody (a held composer, say) is logged to stderr rather
+than swallowed. A structured refusal keeps its code — `agent_not_found` means
+`TRANSIT_TARGET` names nobody, or everloop's own caller identity did not
+resolve, both configuration faults — while a bare message means the daemon could
+not be reached and the outcome is unknown. Either way the message stays claimed
+and the spool redelivers it next poll, in order.
+
+**Body size.** Transit stores at most 64 KiB per message and refuses more with
+`body_too_large`, which is permanent — the drain loop would retry it every poll
+forever and block every message behind it. everloop's own event cap is already
+64 KiB of content before headers and the channel wrapper, so the body is clipped
+to fit with everloop's usual `[everloop] output truncated, N bytes dropped]`
+marker. A dropped tail is visible in the body, never silent.
+
+```jsonc
+// .omp/mcp.json — everloop delivering over Transit (the default: no CHANNEL_SINK)
+{
+  "mcpServers": {
+    "everloop": {
+      "type": "stdio",
+      "command": "everloop",
+      "args": ["serve"],
+      "env": {
+        "EVERLOOP_INSTANCE": "clem",
+        "TRANSIT_TARGET": "clem@titan"
+      }
+    }
+  }
+}
+```
+
+### `CHANNEL_SINK=herdr`
+
+Still fully supported, and unchanged: a box with no Transit daemon, or an agent
+herdr still owns, sets `CHANNEL_SINK=herdr` and behaves exactly as it did
+before the default moved.
+
+| env | default | |
+|---|---|---|
 | `HERDR_TARGET` | *(required)* | the agent's herdr target. Prefer the **agent name** — a pane id dies with the pane, a name survives a restart. |
 | `HERDR_PROMPT_TIMEOUT_MS` | `120000` | the wait bound in milliseconds; a non-numeric or non-positive value is refused at startup rather than silently defaulted |
 | `HERDR_SOCKET_PATH` / `HERDR_SESSION` | `~/.config/herdr/herdr.sock` | same precedence the CLI uses: explicit path, then session, then the default socket |
@@ -441,6 +575,7 @@ move the original stall is reported rather than a success nobody observed.
       "args": ["serve"],
       "env": {
         "EVERLOOP_INSTANCE": "clem",
+        "CHANNEL_SINK": "herdr",
         "HERDR_TARGET": "clem"
       }
     }

@@ -416,11 +416,11 @@ func TestHerdrDriverRejectsMismatchedResponseID(t *testing.T) {
 	}
 }
 
-func TestNewSinkDefaultsToHerdrAndRequiresTarget(t *testing.T) {
-	t.Setenv("CHANNEL_SINK", "")
+func TestNewSinkHerdrIsExplicitAndRequiresTarget(t *testing.T) {
+	t.Setenv("CHANNEL_SINK", "herdr")
 	t.Setenv("HERDR_TARGET", "")
 	if _, err := newSink("everloop"); err == nil || !strings.Contains(err.Error(), "HERDR_TARGET") {
-		t.Fatalf("default sink must refuse without a target, got %v", err)
+		t.Fatalf("herdr sink must refuse without a target, got %v", err)
 	}
 
 	t.Setenv("HERDR_TARGET", "jessica")
@@ -430,7 +430,7 @@ func TestNewSinkDefaultsToHerdrAndRequiresTarget(t *testing.T) {
 	}
 	s, ok := dlv.(*herdrSink)
 	if !ok {
-		t.Fatalf("default sink is %T, want *herdrSink", dlv)
+		t.Fatalf("CHANNEL_SINK=herdr selected %T, want *herdrSink", dlv)
 	}
 	if s.target != "jessica" || s.timeout != time.Duration(herdrDefaultTimeoutMS)*time.Millisecond {
 		t.Fatalf("target=%q timeout=%v", s.target, s.timeout)
@@ -443,7 +443,7 @@ func TestNewSinkRejectsRemovedSinks(t *testing.T) {
 		t.Setenv("CHANNEL_SINK", removed)
 		if _, err := newSink("everloop"); err == nil {
 			t.Fatalf("CHANNEL_SINK=%s must refuse, not fall back to a transport", removed)
-		} else if !strings.Contains(err.Error(), "want herdr") {
+		} else if !strings.Contains(err.Error(), "want transit") {
 			t.Fatalf("refusal should name the accepted values, got %q", err)
 		}
 	}
