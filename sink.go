@@ -2,37 +2,39 @@ package main
 
 // Delivery: how a drained spool message reaches the agent session.
 //
-// There is ONE transport, herdr's socket API, because herdr already knows every
-// harness it drives. It types the event into whatever agent is in the pane —
-// claude, codex, omp, opencode, pi — so the event arrives as ordinary session
-// input and everloop needs no per-harness plane of its own. That is what makes
-// `serve` harness-agnostic: not a menu of sinks, but a transport that does not
-// care which model is on the other end.
-//
-// CHANNEL_SINK selects between delivering and not delivering:
+// CHANNEL_SINK selects the transport:
 //
 //	herdr  (default) agent.prompt over herdr's unix socket — see herdr_socket.go
+//	transit          op:"send" over the local Transit daemon's IPC socket —
+//	                 see transit_socket.go. Opt-in, during the fleet's
+//	                 migration off herdr; herdr stays the default.
 //	none             tools-only serve: no draining, no presence. Pair with a
 //	                 standalone pump that owns delivery ("tools" works too), or
 //	                 use it for a dev checkout that should never deliver.
 //
-// There is deliberately no second sink to fall back on. A per-harness plane —
-// an MCP notification only Claude Code implements, an HTTP turn only opencode
-// accepts, a webhook only hermes answers — is another way to reach an agent
-// herdr can already reach, with its own credentials and its own liveness story,
-// and the one that existed silently dropped events on every other harness. So
-// an unknown CHANNEL_SINK refuses rather than picking something: a value this
-// binary does not implement must fail loudly at startup, not deliver into a
-// void.
+// Both transports are harness-agnostic, and neither is a per-harness plane.
+// herdr types the event into whatever agent is in the pane — claude, codex,
+// omp, opencode, pi. Transit hands it to the daemon, which injects it through
+// a native adapter or through herdr, whichever owns the target. What is
+// deliberately absent is a sink that only one harness implements: an MCP
+// notification only Claude Code answers, an HTTP turn only opencode accepts, a
+// webhook only hermes serves. The one that existed silently dropped events on
+// every other harness, so an unknown CHANNEL_SINK refuses rather than picking
+// something: a value this binary does not implement must fail loudly at
+// startup, not deliver into a void.
 //
 // Messages are wrapped in a `<channel ...meta>content</channel>` envelope, which
-// is what the server's instructions text tells the agent to expect. A delivery
-// failure leaves the message claimed-but-unacked, so the spool's at-least-once
-// reclaim retries it, in order, on the next poll.
+// is what the server's instructions text tells the agent to expect. On the
+// transit transport that envelope is the *body* of a `transit/1` envelope the
+// daemon renders — everloop does not render transit/1 itself.
+//
+// A delivery failure leaves the message claimed-but-unacked, so the spool's
+// at-least-once reclaim retries it, in order, on the next poll.
 
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"sort"
 	"strconv"
@@ -79,13 +81,39 @@ func newSink(source string) (sink, error) {
 			timeout: time.Duration(timeoutMS) * time.Millisecond,
 			source:  source,
 		}, nil
+	case "transit":
+		// The target is required for the same reason HERDR_TARGET is: Transit
+		// would otherwise need everloop to guess an address, and a wrong guess
+		// delivers into someone else's session rather than failing.
+		target := os.Getenv("TRANSIT_TARGET")
+		if target == "" {
+			return nil, fmt.Errorf("CHANNEL_SINK=transit requires TRANSIT_TARGET (a Transit address: name, name@host, or #room)")
+		}
+		timeoutMS := transitDefaultTimeoutMS
+		if v := os.Getenv("TRANSIT_SEND_TIMEOUT_MS"); v != "" {
+			n, err := strconv.Atoi(strings.TrimSpace(v))
+			if err != nil || n < 1 {
+				return nil, fmt.Errorf("invalid TRANSIT_SEND_TIMEOUT_MS %q: want a positive integer (milliseconds)", v)
+			}
+			timeoutMS = n
+		}
+		driver, err := newTransitSocketDriver(transitSocketOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("transit sink: %w", err)
+		}
+		return &transitSink{
+			driver:  driver,
+			target:  target,
+			timeout: time.Duration(timeoutMS) * time.Millisecond,
+			source:  source,
+		}, nil
 	case "none", "tools":
 		// Tools-only: serve exposes the loop tools but never drains (and never
 		// heartbeats presence) — something else owns delivery. Without this,
 		// mounting serve beside a pump would ack messages twice.
 		return nil, nil
 	default:
-		return nil, fmt.Errorf("unknown CHANNEL_SINK %q: want herdr (default) or none", os.Getenv("CHANNEL_SINK"))
+		return nil, fmt.Errorf("unknown CHANNEL_SINK %q: want herdr (default), transit or none", os.Getenv("CHANNEL_SINK"))
 	}
 }
 
@@ -158,4 +186,68 @@ func (s *herdrSink) deliver(content string, meta map[string]string) error {
 		return fmt.Errorf("herdr agent prompt %s: %s: %s", s.target, result.Code, result.Error)
 	}
 	return fmt.Errorf("herdr agent prompt %s: %s", s.target, result.Error)
+}
+
+// --- transit: op:"send" over the daemon's IPC socket -------------------------
+
+// transitSink hands the envelope to the local Transit daemon, which renders the
+// `transit/1` wrapper and injects it through whichever adapter owns the target
+// — a native harness adapter or, still, herdr. Two things come with that which
+// the herdr sink cannot offer: the delivery is in the Transit ledger, so a
+// census settled from the ledger sees it; and the message carries a Transit id
+// the agent settles explicitly, so a redelivery is recognisable rather than a
+// second identical paste.
+//
+// No shell and no subprocess are on this path either: the envelope travels as
+// one literal JSON string.
+type transitSink struct {
+	driver  transitDriver
+	target  string
+	timeout time.Duration
+	source  string
+	// log is nil in production (stderr via the standard logger); a test sets it
+	// to capture the custody warning.
+	log func(string)
+}
+
+// transitDefaultTimeoutMS is what the send gets when TRANSIT_SEND_TIMEOUT_MS is
+// unset. It is deliberately longer than the daemon's own bounds: the daemon
+// holds an IPC connection for 35s and a cross-host send waits up to 10s for the
+// Worker's commit before answering `spooled`. A client that gave up sooner
+// would abandon a send the daemon still completes, and the spool would
+// redeliver a tick Transit already owns.
+const transitDefaultTimeoutMS = 45000
+
+func (s *transitSink) deliver(content string, meta map[string]string) error {
+	result := s.driver.send(context.Background(), s.target, transitBody(s.source, content, meta), s.timeout)
+	if result.OK {
+		// injected, committed and spooled all mean Transit has custody: it
+		// stored the message and owns the retry. Acking here is therefore
+		// required, not tolerated — holding the message so everloop can retry
+		// too is how the agent gets the same tick twice.
+		if result.Warning != "" {
+			s.logf("everloop: transit send %s (%s): %s", s.target, result.State, result.Warning)
+		}
+		return nil
+	}
+	// Anything else leaves the message claimed-but-unacked: the spool reclaims
+	// it on the next poll and drainLoop stops the batch here to preserve order.
+	// The code is the difference that matters — `agent_not_found` means
+	// TRANSIT_TARGET names nobody, or everloop's own caller identity did not
+	// resolve (both configuration faults), while a bare message means the
+	// daemon could not be reached and the delivery outcome is unknown.
+	if result.Code != "" {
+		return fmt.Errorf("transit send %s: %s: %s", s.target, result.Code, result.Error)
+	}
+	return fmt.Errorf("transit send %s: %s", s.target, result.Error)
+}
+
+func (s *transitSink) logf(format string, a ...any) {
+	message := fmt.Sprintf(format, a...)
+	if s.log != nil {
+		s.log(message)
+		return
+	}
+	// stderr: stdout is the MCP JSON-RPC channel.
+	log.Print(message)
 }

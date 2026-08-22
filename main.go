@@ -2,12 +2,13 @@
 // the host actually has — systemd user timers, launchd agents, or everloop's own
 // scheduler daemon where there is no init system to borrow (containers).
 //
-// Delivery is herdr's unix socket and nothing else, so the agent on the other
-// end can be claude, codex, omp, opencode or pi — see sink.go.
+// Delivery is a unix socket either way — herdr's by default, the local Transit
+// daemon's with CHANNEL_SINK=transit — so the agent on the other end can be
+// claude, codex, omp, opencode or pi. See sink.go.
 //
 // One binary, four roles:
 //   - `everloop serve`      the MCP server the agent spawns (stdio), which also
-//     drains the spool into herdr
+//     drains the spool into the configured sink
 //   - `everloop scheduler`  the supervised daemon that fires loops when the
 //     portable backend is live (see backend.go for the choice)
 //   - `everloop tick NAME`  one firing, spooled: what a timer executes
