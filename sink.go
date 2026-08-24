@@ -140,7 +140,7 @@ func newSink(source string) (sink, error) {
 // implicit transport this file refuses to pick, and it would leave the box in
 // exactly the ledger blind spot the new default closes.
 func missingTransitTarget(byDefault bool) error {
-	const address = "TRANSIT_TARGET (a Transit address: name, name@host, or #room)"
+	const address = "TRANSIT_TARGET (a Transit address: name@host, organization/name@host, #room, or organization/#room)"
 	switch {
 	case !byDefault:
 		return fmt.Errorf("CHANNEL_SINK=transit requires %s", address)

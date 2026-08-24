@@ -164,15 +164,17 @@ claude/codex — naming the instance and the Transit address to deliver to:
 
 ```json
 { "mcpServers": { "everloop": { "command": "/home/stephan/.local/bin/everloop", "args": ["serve"],
-  "env": { "EVERLOOP_INSTANCE": "clem", "TRANSIT_TARGET": "clem@titan" } } } }
+  "env": { "EVERLOOP_INSTANCE": "clem", "TRANSIT_TARGET": "clem@ocai" } } } }
 ```
 
-`TRANSIT_TARGET` is required (a Transit address: `name`, `name@host` or
-`#room`); absent, the sink refuses at startup rather than guessing. everloop
-hands the daemon a body and the daemon renders the `transit/1` envelope, so the
-channel envelope arrives inside a transit one and the meta contract is
-unchanged. Optional knobs: `TRANSIT_SEND_TIMEOUT_MS` (default 45000) and
-`TRANSIT_SOCKET` / `TRANSIT_DATA_DIR`.
+`TRANSIT_TARGET` is required (a Transit address: `name@host`,
+`organization/name@host`, `#room`, or `organization/#room`); a bare name is
+invalid because Transit must know the host. Absent, the sink refuses at startup
+rather than guessing. everloop hands the daemon a body and the daemon renders
+the `transit/1` envelope, so the channel envelope arrives inside a transit one
+and the meta contract is unchanged. Optional knobs:
+`TRANSIT_SEND_TIMEOUT_MS` (default 45000) and `TRANSIT_SOCKET` /
+`TRANSIT_DATA_DIR`.
 
 To stay on herdr, say so explicitly — `HERDR_TARGET` on its own is no longer a
 complete config:

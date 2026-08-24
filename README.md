@@ -89,7 +89,7 @@ for omp, `.mcp.json` for claude/codex — with the target it should deliver to:
       "args": ["serve"],
       "env": {
         "EVERLOOP_INSTANCE": "clem",
-        "TRANSIT_TARGET": "clem@titan"
+        "TRANSIT_TARGET": "clem@ocai"
       }
     }
   }
@@ -454,7 +454,7 @@ redelivery is recognisable to the agent rather than a second identical paste.
 
 | env | default | |
 |---|---|---|
-| `TRANSIT_TARGET` | *(required)* | the Transit address to deliver to: `name`, `name@host`, or `#room`. Absent, the sink refuses at startup rather than guessing an address and delivering into someone else's session. |
+| `TRANSIT_TARGET` | *(required)* | the Transit address to deliver to: `name@host`, `organization/name@host`, `#room`, or `organization/#room`. A bare name is invalid: Transit must know the host. Absent, the sink refuses at startup rather than guessing an address and delivering into someone else's session. |
 | `TRANSIT_SEND_TIMEOUT_MS` | `45000` | the send bound in milliseconds; a non-numeric or non-positive value is refused at startup. The default is deliberately past the daemon's own bounds — it holds an IPC connection for 35s, and a cross-host send waits up to 10s for the Worker's commit — so everloop never abandons a send the daemon is still completing. |
 | `TRANSIT_SOCKET` / `TRANSIT_DATA_DIR` | `~/.local/share/transit/transit.sock` | same precedence transit itself uses, so the two cannot disagree about where the socket is |
 
@@ -514,7 +514,7 @@ marker. A dropped tail is visible in the body, never silent.
       "args": ["serve"],
       "env": {
         "EVERLOOP_INSTANCE": "clem",
-        "TRANSIT_TARGET": "clem@titan"
+        "TRANSIT_TARGET": "clem@ocai"
       }
     }
   }
