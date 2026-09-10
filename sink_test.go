@@ -142,12 +142,12 @@ func testDriver(t *testing.T, server *fakeHerdrServer) *herdrSocketDriver {
 }
 
 func TestEnvelopeEscapesAndSortsAttrs(t *testing.T) {
-	got := envelope("tincan", "hello\nworld", map[string]string{
+	got := envelope("everloop", "hello\nworld", map[string]string{
 		"from":  `a&b"c`,
 		"kind":  "message",
 		"empty": "",
 	})
-	want := "<channel source=\"tincan\" from=\"a&amp;b&quot;c\" kind=\"message\">\nhello\nworld\n</channel>"
+	want := "<channel source=\"everloop\" from=\"a&amp;b&quot;c\" kind=\"message\">\nhello\nworld\n</channel>"
 	if got != want {
 		t.Fatalf("envelope mismatch:\n got: %q\nwant: %q", got, want)
 	}
@@ -443,7 +443,7 @@ func TestNewSinkRejectsRemovedSinks(t *testing.T) {
 		t.Setenv("CHANNEL_SINK", removed)
 		if _, err := newSink("everloop"); err == nil {
 			t.Fatalf("CHANNEL_SINK=%s must refuse, not fall back to a transport", removed)
-		} else if !strings.Contains(err.Error(), "want transit") {
+		} else if !strings.Contains(err.Error(), "want mattermost") {
 			t.Fatalf("refusal should name the accepted values, got %q", err)
 		}
 	}

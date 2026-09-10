@@ -19,11 +19,9 @@ package main
 //
 // Adapted from courier's driver (~/projects/ocai/courier/herdr.go), which is the
 // deployed reference for this protocol. It is copied rather than imported
-// because all three of courier, tincan and everloop are `package main`, so
-// nothing in them is importable; and because the three deliberately differ in
-// what they accept and how long they wait. tincan's client is the simpler
-// cousin — it never waits for a turn — which is why courier's is the one
-// tracked here.
+// because courier is `package main`, so nothing in it is importable; and
+// because this sink deliberately differs from it in what it accepts and how
+// long it waits.
 
 import (
 	"context"
@@ -195,7 +193,7 @@ func resolveHerdrSocketPath(opts herdrSocketOptions) (string, error) {
 // acceptedHerdrProtocols never fails on a malformed entry: this is read at
 // startup on eight boxes, and a typo in an override must not stop delivery for
 // a protocol that would have been accepted anyway. Unparseable tokens are
-// skipped, which is tincan's behavior for the same knob.
+// skipped rather than treated as a fatal misconfiguration.
 func acceptedHerdrProtocols(extra string) map[int]struct{} {
 	accepted := map[int]struct{}{everloopHerdrProtocol: {}, herdrProtocol20: {}}
 	for _, token := range strings.Split(extra, ",") {

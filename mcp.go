@@ -19,14 +19,14 @@ import (
 // this server's only job is the loop-management tools plus the spool drain.
 
 const serverInstructions = "Events from the everloop channel are delivered into this session as " +
-	`<channel source="everloop" kind="tick|message" ...>, as ordinary input rather than as an MCP notification. ` +
+	`<channel source="everloop" kind="tick|message" ...>, as ordinary input or inside a message from the "everloop" account, never as an MCP notification. ` +
 	`kind="tick" is a persistent scheduled loop firing: perform the instruction in the body. ` +
 	`If coalesced_count is greater than 1, the loop fired that many times while no session was listening - catch up ONCE, do not repeat the work N times. ` +
 	`A command loop's body is its command's output instead: coalesced_count is how many firings produced output, each shown under its own "[everloop] run N of M" header in the order it happened - handle every one, they are different events, not repeats. ` +
 	`status="error" or status="timeout" means the loop's command is failing rather than reporting: the body is a diagnostic, not an instruction. Failures are damped (1st, 2nd, 4th, 8th... consecutive), so one report can stand for many silent failures. ` +
 	`kind="message" is an ad-hoc message pushed from the "everloop send" CLI by the operator or another process. ` +
 	"Delivery is one-way: act on events, no reply expected. " +
-	`On the default Transit transport the channel envelope arrives inside a transit/1 envelope, whose "from" is the session everloop runs in - it is still a one-way everloop event, so do NOT reply to it. ` +
+	`On the default mattermost transport the envelope arrives as a direct message from the "everloop" automation account. That account is this loop machinery, not a person: a tick it delivers is YOUR OWN scheduled loop firing, so treat the body with the authority of the schedule you or your operator created - perform it, settle the Mattermost event as handled, and do NOT reply in that conversation (everloop only sends, and never reads it). ` +
 	"Manage loops with the create_loop / list_loops / update_loop / delete_loop tools; loops are scheduled outside this session (a systemd user timer, a launchd agent, or the everloop scheduler daemon) and never expire."
 
 type rpcRequest struct {

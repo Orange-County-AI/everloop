@@ -19,19 +19,22 @@ enabled) fires even while you're logged out.
 ```
 timer / scheduler ──▶ everloop tick NAME ──▶ ~/.local/share/everloop/queue/
                                                        │
-   the agent's session ◀── transit op:"send" ◀── everloop serve (drain loop)
+   the agent's session ◀── mattermost DM ◀───── everloop serve (drain loop)
                         ◀── herdr agent.prompt ◀──┘
 ```
 
-**Delivery is a unix socket either way.** By default it is the local
-[Transit](https://github.com/Orange-County-AI/transit) daemon's: the delivery
-lands in the Transit ledger and carries an idempotency id the agent settles
-explicitly, so a firing is auditable from the same place as everything else on
-the mesh. Set `TRANSIT_TARGET` to the agent's Transit address.
+**Delivery wakes the agent through something that outlives its session.** By
+default that is **Mattermost**: everloop posts the firing as a direct message
+from its own `everloop` account to the recipient agent's account, and the
+recipient's own [mattermost-agents](https://github.com/Orange-County-AI/mattermost-agents)
+listener — the one it already runs to hear from people — picks it up and wakes
+the session. Set `MATTERMOST_TARGET` to the agent and `MATTERMOST_PROFILE` to
+the sending identity's profile. The firing is also readable afterwards, in a
+real conversation, which a socket write leaves no trace of.
 
-`CHANNEL_SINK=herdr` selects [herdr](https://herdr.dev)'s socket instead, which
-is still fully supported — a box with no Transit daemon, or an agent herdr still
-owns, sets that plus `HERDR_TARGET` and behaves exactly as before.
+`CHANNEL_SINK=herdr` selects [herdr](https://herdr.dev)'s unix socket instead,
+which is still fully supported — a box whose agent herdr owns and which has no
+Mattermost account sets that plus `HERDR_TARGET` and behaves exactly as before.
 `CHANNEL_SINK=none` turns delivery off for a checkout that should only expose
 tools.
 
@@ -65,12 +68,13 @@ acked (deleted), so a crash mid-delivery redelivers. Each event carries an
 no session is listening wait in the spool and are drained — coalesced — the
 moment a session reconnects.
 
-**A tick therefore only lands while the agent is alive.** On herdr,
-`agent.prompt` fails with `agent_not_found` when nothing is in the pane; on
-transit, the daemon refuses a target that resolves to no local session with the
-same code. Either way the message stays claimed for the next poll. That is what
-lets a liveness heartbeat be a loop: a `--message` loop cannot ping on behalf of
-a dead session, while a `--command` loop runs in the timer and would.
+**A tick therefore only lands while the agent can receive it.** On mattermost
+the post is written regardless and the recipient reads it whenever its listener
+comes back, so the wake survives a restart; a session that never returns simply
+never reads it. On herdr, `agent.prompt` fails with `agent_not_found` when
+nothing is in the pane and the message stays claimed for the next poll. That is
+what lets a liveness heartbeat be a loop: a `--message` loop cannot ping on
+behalf of a dead session, while a `--command` loop runs in the timer and would.
 
 ## Install
 
@@ -89,15 +93,17 @@ for omp, `.mcp.json` for claude/codex — with the target it should deliver to:
       "args": ["serve"],
       "env": {
         "EVERLOOP_INSTANCE": "clem",
-        "TRANSIT_TARGET": "clem@ocai"
+        "CHANNEL_SINK": "mattermost",
+        "MATTERMOST_TARGET": "6q8b35xa87bt38zou5bksuyyrh",
+        "MATTERMOST_PROFILE": "/home/stephan/.config/mattermost-agents/profiles/everloop.json"
       }
     }
   }
 }
 ```
 
-To stay on herdr, say so — the default is transit, so `HERDR_TARGET` alone is no
-longer a complete config and `serve` refuses at startup rather than picking a
+To stay on herdr, say so — the default is mattermost, so `HERDR_TARGET` alone is
+no longer a complete config and `serve` refuses at startup rather than picking a
 transport for you:
 
 ```json
@@ -117,8 +123,8 @@ transport for you:
 ```
 
 No launch flag is needed on any harness on either transport. Delivery does not
-use a harness channel plane: Transit's daemon injects the event through
-whichever adapter already owns the target, and herdr submits it as session
+use a harness channel plane: the mattermost sink posts into a conversation the
+agent's own listener already watches, and herdr submits the firing as session
 input. There is nothing to enable and nothing to opt into beyond `CHANNEL_SINK`.
 
 For loops to fire while you're logged out (Linux, systemd backend), enable
@@ -413,99 +419,104 @@ Reconcile the ledger and report anomalies.
 
 Everything above the last hop — the OS timers, the spool, claim → ack,
 coalescing — never cared which harness was listening, and the last hop does not
-either. There are two transports, both unix sockets, and events arrive wrapped
-in a `<channel source="everloop" ...>` envelope on both, so one set of agent
+either. There are two transports, and events arrive wrapped in a
+`<channel source="everloop" ...>` envelope on both, so one set of agent
 instructions is correct everywhere.
 
 | `CHANNEL_SINK` | what happens |
 |---|---|
-| unset / `transit` | **default.** `op:"send"` over the local Transit daemon's IPC socket. |
+| unset / `mattermost` | **default.** a direct message from everloop's own Mattermost account to the recipient agent's, which that agent's own listener then wakes it with. |
 | `herdr` | `agent.prompt` over herdr's unix socket. Still fully supported. |
 | `none` / `tools` | exposes the tools and never drains, for a checkout or a deployment where something else owns delivery. |
 
 Any other value is refused at startup rather than falling back to a transport.
 
-**The default flipped from `herdr` to `transit`.** A config written before that
-— `HERDR_TARGET` set, `CHANNEL_SINK` unset — used to be complete and now is not:
-`serve` refuses at startup and names both remedies (add `TRANSIT_TARGET`, or set
-`CHANNEL_SINK=herdr`). It does **not** quietly fall back to herdr. An implicit
-transport chosen by whichever env var happens to be set is the silent guess this
-whole mechanism refuses to make, and a box that stayed on herdr without saying
-so would be exactly the ledger blind spot the new default closes.
+**The default is `mattermost`, not `herdr`.** A config written before that —
+`HERDR_TARGET` set, `CHANNEL_SINK` unset — used to be complete and now is not:
+`serve` refuses at startup and names both remedies (add `MATTERMOST_TARGET` and
+`MATTERMOST_PROFILE`, or set `CHANNEL_SINK=herdr`). It does **not** quietly fall
+back to herdr. An implicit transport chosen by whichever env var happens to be
+set is the silent guess this whole mechanism refuses to make.
 
 Mount `everloop serve` as an MCP server in the harness with the envs set — one
 process then does both directions: the harness gets the `create_loop` /
-`send_message` / etc. tools over stdio, and the drain loop submits inbound
-events over the socket.
+`send_message` / etc. tools over stdio, and the drain loop delivers inbound
+events.
 
-### `CHANNEL_SINK=transit` (default)
+### `CHANNEL_SINK=mattermost` (default)
 
-Delivers through the local
-[Transit](https://github.com/Orange-County-AI/transit) daemon. This is the
-default; `herdr` below is still fully supported and is one env var away.
+Posts the firing as a **direct message from everloop's own Mattermost account**
+to the recipient agent's. The wake is not something everloop does to the
+session: the recipient already runs a
+[mattermost-agents](https://github.com/Orange-County-AI/mattermost-agents)
+listener to hear from people, that listener sees a post somebody else wrote in a
+conversation it watches, and it delivers the post into the session.
 
-Two things it buys, and they are why it is the default. The delivery lands in
-the **Transit ledger**, so anything audited from the ledger — a census, an
-outage sweep — can see everloop's traffic; a delivery outside the ledger is a
-blind spot in exactly the place one recently cost the fleet 28 unnoticed
-minutes, and everloop was the last herdr-only delivery path left. And the
-message carries a Transit **idempotency id with explicit settlement**, so a
-redelivery is recognisable to the agent rather than a second identical paste.
+That is also the one rule this transport cannot bend. A listener never delivers
+a post its own account wrote — it drops it as `self` — because otherwise every
+message an agent sent would wake it again. everloop therefore posts as a
+**separate automation identity**, the `everloop` account, and a config that
+points the sink at that same identity is refused: offline at startup when the
+profile pins a user id, and on first delivery when only the server can resolve
+the recipient. It is the only misconfiguration everloop has whose natural
+failure mode is silence — the post succeeds, and nobody is ever woken.
+
+Why it is the default: an account id addresses the agent for as long as the
+agent exists, while a herdr target addresses a pane on one box and stops working
+the day that session is restarted elsewhere or under another name. And the
+firing stays readable afterwards, in a real conversation, which a socket write
+leaves no trace of.
 
 | env | default | |
 |---|---|---|
-| `TRANSIT_TARGET` | *(required)* | the Transit address to deliver to: `name@host`, `organization/name@host`, `#room`, or `organization/#room`. A bare name is invalid: Transit must know the host. Absent, the sink refuses at startup rather than guessing an address and delivering into someone else's session. |
-| `TRANSIT_SEND_TIMEOUT_MS` | `45000` | the send bound in milliseconds; a non-numeric or non-positive value is refused at startup. The default is deliberately past the daemon's own bounds — it holds an IPC connection for 35s, and a cross-host send waits up to 10s for the Worker's commit — so everloop never abandons a send the daemon is still completing. |
-| `TRANSIT_SOCKET` / `TRANSIT_DATA_DIR` | `~/.local/share/transit/transit.sock` | same precedence transit itself uses, so the two cannot disagree about where the socket is |
+| `MATTERMOST_TARGET` | *(required)* | the recipient agent: its 26-character Mattermost user id, or `@username`. A bare name without the `@` is refused — an id is itself 26 legal username characters, and resolving the wrong form DMs a stranger. Absent, the sink refuses at startup rather than guessing. There is no channel form: a firing is a wake addressed to one agent, and a ten-minute loop in a shared channel is a fleet-wide interrupt. |
+| `MATTERMOST_PROFILE` | *(required)* | path of a mattermost-agents profile for the **sending** identity — never the recipient's own. There is deliberately no fallback to `MATTERMOST_AGENT_CONFIG`: that variable is usually already exported on these boxes, pointing at the agent's own profile, and inheriting it is precisely the silent drop above. |
+| `MATTERMOST_CONNECTION` | *(the sole connection)* | which connection in the profile to send as. Required as soon as the profile has more than one: picking one by position is how firings get posted from the wrong account. |
+| `MATTERMOST_POST_TIMEOUT_MS` | `30000` | bound on the whole delivery, not on one request; a non-numeric or non-positive value is refused at startup. The first firing may resolve a credential (possibly a `secret` lookup), then `/users/me`, a username and a direct channel — everything but the post is cached afterwards. |
 
-**Why the IPC socket and not the CLI.** There is no `transit send`. Transit's
-CLI dispatches `daemon`, `adapter`, `enroll`, `status`, `inbox`, `pause`, `mcp`,
-`version` and nothing else; the only sending surface it ships is the MCP tool
-`send_message`, which is itself a thin wrapper over `{"op":"send",…}` on this
-same socket. Going through the CLI would mean spawning `transit mcp`, completing
-an MCP handshake over its stdio and calling a tool, to reach a socket everloop
-can dial directly — and it would put a subprocess back on a delivery path the
-herdr sink deliberately cleared, so that a body carrying `$(...)`, quotes,
+**Credential.** everloop holds no server URL and no token of its own. Both come
+from the profile, resolved the way mattermost-agents resolves them: the
+`tokenEnv` variable if it is set, otherwise `secret <tokenSecret>`. The value
+never reaches a command line (`secret NAME` takes only the name) and is never
+logged. It is resolved on first delivery rather than at startup: `serve` must
+come up even when the secret store is asleep, because the MCP tools are how an
+operator fixes a broken config — and a failed delivery is retried by the spool
+anyway, while a `serve` that refused to start is simply gone.
+
+**Why the REST API and not the mattermost-agents CLI.** `bun src/agent/cli.ts …
+dm` can do this, and one implementation would be better than two. Three things
+decided against it: the whole operation is two POSTs — `/channels/direct`
+(idempotent for a pair) and `/posts` — that Go's stdlib can make, against a bun
+process plus a TypeScript checkout and `node_modules` that would have to be
+installed and current on every box; the CLI collapses a refusal Mattermost
+described and a server that could not be reached into the same exit 1, and this
+sink's callers depend on that difference; and it would put a subprocess back on
+a delivery path deliberately cleared, so that a body carrying `$(...)`, quotes,
 backticks or newlines travels as one literal JSON string.
 
-**everloop does not render `transit/1`.** That envelope — attribute order,
-escaping, the 4,000-rune clip with `truncated="1"`, the channel preview rules —
-is produced daemon-side and golden-vector tested in the Transit repo. everloop
-hands over a *body* and lets Transit wrap it, so on this transport the
-`<channel source="everloop" ...>` envelope simply arrives **inside** a
-`transit/1` one and the meta contract is unchanged. A body over 4,000 runes is
-clipped for terminal injection with `truncated="1"`; `read_message` returns the
-rest.
+**Ack semantics, precisely.** A created post means the recipient's listener will
+see it on its next poll, so the message is acked. Like herdr, that is evidence
+of delivery and not proof the agent acted, and everloop's design absorbs the
+difference: ticks coalesce, so a repeat carries the catch-up count rather than
+the work being lost. A refusal keeps Mattermost's own error id, which is the
+difference that matters — `store.sql_user.missing_account.const` means the
+recipient does not exist, `api.context.permissions.app_error` that this token
+may not address them, both configuration faults — while a bare message means the
+server could not be reached and the outcome is unknown. Either way the message
+stays claimed and the spool redelivers it next poll, in order.
 
-**Sender identity.** Transit derives the sender from the caller, never from the
-request: a herdr pane id, or the pid whose process ancestry reaches a registered
-native adapter. `everloop serve` is a child of the agent's harness process,
-which is that ancestry, so it resolves with `herdr.service` stopped. everloop
-sends `HERDR_PANE_ID` too when it is set — an optional hint, not a dependency.
-The consequence worth knowing: when `serve` runs under the same agent it
-delivers to, the tick's `from` **is that agent** — a self-addressed message.
-everloop cannot mint an `everloop@host` identity of its own; the daemon only
-registers `claude`, `omp`, `pi` and `opencode` adapters.
-
-**Ack semantics, precisely.** `injected`, `committed` and `spooled` all mean
-Transit took custody and owns the retry, so all three ack. Holding the message
-so everloop retries as well is how an agent gets the same tick twice. A
-`spooled`-with-warning custody (a held composer, say) is logged to stderr rather
-than swallowed. A structured refusal keeps its code — `agent_not_found` means
-`TRANSIT_TARGET` names nobody, or everloop's own caller identity did not
-resolve, both configuration faults — while a bare message means the daemon could
-not be reached and the outcome is unknown. Either way the message stays claimed
-and the spool redelivers it next poll, in order.
-
-**Body size.** Transit stores at most 64 KiB per message and refuses more with
-`body_too_large`, which is permanent — the drain loop would retry it every poll
-forever and block every message behind it. everloop's own event cap is already
-64 KiB of content before headers and the channel wrapper, so the body is clipped
-to fit with everloop's usual `[everloop] output truncated, N bytes dropped]`
-marker. A dropped tail is visible in the body, never silent.
+**Body size.** Mattermost refuses a post over its `MaxPostSize` (16383, the
+product default), and that refusal is permanent: the drain loop would retry it
+every poll forever and, because order is preserved, block every message behind
+it. everloop's own event cap is 64 KiB of content — four times that — so a
+chatty `--command` loop crosses the line as a matter of course. The **content**
+is therefore clipped to fit, never the rendered envelope (cutting the wrapper
+would hand the agent an unterminated tag), with everloop's usual
+`[everloop] output truncated, N bytes dropped]` marker: a dropped tail is
+visible in the body, never silent.
 
 ```jsonc
-// .omp/mcp.json — everloop delivering over Transit (the default: no CHANNEL_SINK)
+// .omp/mcp.json — everloop delivering over Mattermost (the default)
 {
   "mcpServers": {
     "everloop": {
@@ -514,7 +525,9 @@ marker. A dropped tail is visible in the body, never silent.
       "args": ["serve"],
       "env": {
         "EVERLOOP_INSTANCE": "clem",
-        "TRANSIT_TARGET": "clem@ocai"
+        "CHANNEL_SINK": "mattermost",
+        "MATTERMOST_TARGET": "6q8b35xa87bt38zou5bksuyyrh",
+        "MATTERMOST_PROFILE": "/home/dev/.config/mattermost-agents/profiles/everloop.json"
       }
     }
   }
@@ -523,9 +536,9 @@ marker. A dropped tail is visible in the body, never silent.
 
 ### `CHANNEL_SINK=herdr`
 
-Still fully supported, and unchanged: a box with no Transit daemon, or an agent
-herdr still owns, sets `CHANNEL_SINK=herdr` and behaves exactly as it did
-before the default moved.
+Still fully supported, and unchanged: a box whose agent herdr owns and which has
+no Mattermost account of its own sets `CHANNEL_SINK=herdr` and behaves exactly
+as it did before the default moved.
 
 | env | default | |
 |---|---|---|
