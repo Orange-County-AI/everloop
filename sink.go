@@ -1,61 +1,38 @@
 package main
 
-// Delivery: how a drained spool message reaches the agent session.
+// Delivery sinks: how a drained spool message reaches the agent session.
+// `serve` is harness-agnostic — the MCP tools and the spool protocol are the
+// same everywhere; only the last hop differs. CHANNEL_SINK selects it:
 //
-// CHANNEL_SINK selects the transport:
+//	claude   (default) MCP notifications/claude/channel — Claude Code channels
+//	none               tools-only serve: no draining, no presence; pair with a
+//	                   standalone `tincan pump` that owns delivery ("tools" works too)
+//	opencode           POST {OPENCODE_URL}/session/{id}/prompt_async — pushes a
+//	                   real user turn into a persistent opencode session
+//	hermes             POST {HERMES_WEBHOOK_URL} — a Hermes webhook route (V2
+//	                   HMAC); each event spawns a run (Hermes has no persistent
+//	                   session to inject into)
 //
-//	mattermost (default) a direct message from everloop's own Mattermost
-//	                     account to the recipient agent's, which that agent's
-//	                     own mattermost-agents listener picks up and wakes the
-//	                     session with — see mattermost_api.go
-//	herdr                agent.prompt over herdr's unix socket — see
-//	                     herdr_socket.go. Still fully supported: a box whose
-//	                     agent herdr owns and which has no Mattermost account
-//	                     sets this and nothing changes for it.
-//	none                 tools-only serve: no draining, no presence. Pair with
-//	                     a standalone pump that owns delivery ("tools" works
-//	                     too), or use it for a dev checkout that should never
-//	                     deliver.
-//
-// Mattermost is the default because it is the one transport that outlives the
-// session it wakes. herdr delivery addresses a pane on this same box, so it
-// stops working the day the agent is restarted elsewhere or under a different
-// name; an account id is the agent's address for as long as the agent exists.
-// The wake also lands in a conversation an operator can read back afterwards,
-// which a socket write leaves no trace of.
-//
-// Both transports are harness-agnostic, and neither is a per-harness plane.
-// herdr types the event into whatever agent is in the pane — claude, codex,
-// omp, opencode, pi. Mattermost hands it to the listener that agent already
-// runs to hear from people, whichever harness it is. What is deliberately
-// absent is a sink that only one harness implements: an MCP notification only
-// Claude Code answers, an HTTP turn only opencode accepts, a webhook only
-// hermes serves. The one that existed silently dropped events on every other
-// harness, so an unknown CHANNEL_SINK refuses rather than picking something: a
-// value this binary does not implement must fail loudly at startup, not deliver
-// into a void.
-//
-// Messages are wrapped in a `<channel ...meta>content</channel>` envelope,
-// which is what the server's instructions text tells the agent to expect. On
-// the mattermost transport that envelope is the body of the post, clipped to
-// the server's post bound — see mattermostBody.
-//
-// THE DEFAULT CHANGED, and a config that predates the change — HERDR_TARGET
-// set, CHANNEL_SINK unset — used to be complete and now is not. Such a config
-// refuses at startup with both remedies named rather than falling back to
-// herdr: an implicit transport chosen by whichever env var happens to be set is
-// the silent guess this whole file exists to refuse.
-//
-// A delivery failure leaves the message claimed-but-unacked, so the spool's
-// at-least-once reclaim retries it, in order, on the next poll.
+// Non-claude sinks wrap the message in the same `<channel ...meta>content
+// </channel>` envelope Claude Code produces, so the server's instructions text
+// describes the format accurately on every harness. Delivery failures leave
+// the message claimed-but-unacked, so the spool's at-least-once reclaim
+// retries it on the next poll.
 
 import (
-	"context"
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -63,142 +40,56 @@ type sink interface {
 	deliver(content string, meta map[string]string) error
 }
 
-// newSink picks delivery from env. `source` is the channel name that goes in the
-// envelope's `source` attribute (for this program, "everloop").
-func newSink(source string) (sink, error) {
-	requested := strings.ToLower(strings.TrimSpace(os.Getenv("CHANNEL_SINK")))
-	switch requested {
-	case "", "mattermost":
-		// The recipient is required for the same reason HERDR_TARGET is:
-		// everloop would otherwise have to guess an address, and a wrong guess
-		// posts a firing into a stranger's inbox rather than failing.
-		target := os.Getenv("MATTERMOST_TARGET")
-		if target == "" {
-			return nil, missingMattermostTarget(requested == "")
-		}
-		dest, err := parseMattermostTarget(target)
-		if err != nil {
-			return nil, err
-		}
-		// The SENDING identity, which must not be the recipient's own: a
-		// listener never delivers a post its own account wrote. There is
-		// deliberately no default and no fall back to MATTERMOST_AGENT_CONFIG
-		// — that variable is usually already exported on these boxes, pointing
-		// at the agent's own profile, and inheriting it is exactly the
-		// silently-dropped delivery this sink refuses.
-		profile := os.Getenv("MATTERMOST_PROFILE")
-		if profile == "" {
-			return nil, fmt.Errorf("CHANNEL_SINK=mattermost requires MATTERMOST_PROFILE (the path of a mattermost-agents profile for the SENDING identity — a separate automation account, never the recipient's own, whose listener would drop its own posts)")
-		}
-		timeoutMS := mattermostDefaultTimeoutMS
-		if v := os.Getenv("MATTERMOST_POST_TIMEOUT_MS"); v != "" {
-			n, err := strconv.Atoi(strings.TrimSpace(v))
-			if err != nil || n < 1 {
-				return nil, fmt.Errorf("invalid MATTERMOST_POST_TIMEOUT_MS %q: want a positive integer (milliseconds)", v)
-			}
-			timeoutMS = n
-		}
-		driver, err := newMattermostHTTPDriver(mattermostOptions{
-			ProfilePath: profile,
-			Connection:  os.Getenv("MATTERMOST_CONNECTION"),
-		})
-		if err != nil {
-			return nil, fmt.Errorf("mattermost sink: %w", err)
-		}
-		// Offline half of the self-delivery guard: when the profile pins the
-		// sender's user id and the target is a user id, the silent drop is
-		// knowable now rather than after the first firing disappears.
-		if err := driver.refuseSelfDelivery(dest); err != nil {
-			return nil, err
-		}
-		return &mattermostSink{
-			driver:  driver,
-			dest:    dest,
-			timeout: time.Duration(timeoutMS) * time.Millisecond,
-			source:  source,
-		}, nil
-	case "herdr":
-		target := os.Getenv("HERDR_TARGET")
-		if target == "" {
-			// Refuse rather than guess. A pane id would be available from
-			// HERDR_PANE_ID, but a pane id dies with the pane while an agent
-			// name survives a restart, so silently picking the short-lived one
-			// would turn a config omission into a delivery that stops working
-			// a week later.
-			return nil, fmt.Errorf("CHANNEL_SINK=herdr requires HERDR_TARGET (a herdr agent target: agent name, pane id, or workspace/tab path)")
-		}
-		timeoutMS := herdrDefaultTimeoutMS
-		if v := os.Getenv("HERDR_PROMPT_TIMEOUT_MS"); v != "" {
-			// Refuse a bad value rather than quietly falling back: a typo here
-			// would otherwise wait two minutes per event and look like a slow
-			// agent, with nothing saying the setting never took.
-			n, err := strconv.Atoi(strings.TrimSpace(v))
-			if err != nil || n < 1 {
-				return nil, fmt.Errorf("invalid HERDR_PROMPT_TIMEOUT_MS %q: want a positive integer (milliseconds)", v)
-			}
-			timeoutMS = n
-		}
-		driver, err := newHerdrSocketDriver(herdrSocketOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("herdr sink: %w", err)
-		}
-		return &herdrSink{
-			driver:  driver,
-			target:  target,
-			timeout: time.Duration(timeoutMS) * time.Millisecond,
-			source:  source,
-		}, nil
+// newSink picks the delivery path from env. `source` is the channel name used
+// in the envelope ("tincan" / "everloop"); `out` is the MCP stdout writer the
+// claude sink notifies on.
+func newSink(source string, out *stdoutWriter) (sink, error) {
+	switch strings.ToLower(os.Getenv("CHANNEL_SINK")) {
+	case "", "claude":
+		return &claudeSink{out: out}, nil
 	case "none", "tools":
-		// Tools-only: serve exposes the loop tools but never drains (and never
-		// heartbeats presence) — something else owns delivery. Without this,
-		// mounting serve beside a pump would ack messages twice.
+		// Tools-only: serve exposes send_message/list_peers but never drains
+		// (and never heartbeats presence) — a standalone `tincan pump` owns
+		// delivery for the mailbox. Without this, mounting serve next to a
+		// pump would ack messages into a harness that ignores channel
+		// notifications, silently losing them.
 		return nil, nil
-	default:
-		return nil, fmt.Errorf("unknown CHANNEL_SINK %q: want mattermost (default), herdr or none", os.Getenv("CHANNEL_SINK"))
-	}
-}
-
-// missingMattermostTarget refuses, and says how to fix it. A deployment that
-// predates the default change arrives here with CHANNEL_SINK unset and
-// HERDR_TARGET set — a config that used to be complete — so that case gets
-// both remedies by name. Quietly using herdr for it instead would be the
-// implicit transport this file refuses to pick.
-func missingMattermostTarget(byDefault bool) error {
-	const address = "MATTERMOST_TARGET (the recipient agent: @username or its 26-character Mattermost user id)"
-	switch {
-	case !byDefault:
-		return fmt.Errorf("CHANNEL_SINK=mattermost requires %s", address)
-	case os.Getenv("HERDR_TARGET") != "":
-		return fmt.Errorf("CHANNEL_SINK is unset and now defaults to mattermost, which requires %s. HERDR_TARGET is set, so this config predates the change: either add MATTERMOST_TARGET and MATTERMOST_PROFILE to move this session onto Mattermost, or set CHANNEL_SINK=herdr to keep the previous transport", address)
-	default:
-		return fmt.Errorf("CHANNEL_SINK is unset and defaults to mattermost, which requires %s. Set CHANNEL_SINK=herdr for the herdr transport, or CHANNEL_SINK=none for a tools-only serve", address)
-	}
-}
-
-// parseMattermostTarget accepts the two recipient forms that can be validated
-// before the first delivery: an @username, and a bare Mattermost user id. A
-// username needs the sigil because an id is itself 26 legal username
-// characters, and resolving the wrong one posts a firing to a stranger.
-//
-// There is deliberately no channel form. A firing is a wake addressed to one
-// agent; posted in a shared channel it would wake every member on every tick,
-// and a ten-minute loop in a team channel is a fleet-wide interrupt.
-func parseMattermostTarget(raw string) (mattermostDest, error) {
-	target := strings.TrimSpace(raw)
-	if name, ok := strings.CutPrefix(target, "@"); ok {
-		if name == "" {
-			return mattermostDest{}, fmt.Errorf("invalid MATTERMOST_TARGET %q: no username after the @", raw)
+	case "opencode":
+		return &opencodeSink{
+			base:      strings.TrimRight(envOr("OPENCODE_URL", "http://127.0.0.1:4096"), "/"),
+			sessionID: os.Getenv("OPENCODE_SESSION_ID"),
+			title:     envOr("OPENCODE_SESSION_TITLE", "channel"),
+			directory: os.Getenv("OPENCODE_DIRECTORY"),
+			username:  envOr("OPENCODE_SERVER_USERNAME", "opencode"),
+			password:  os.Getenv("OPENCODE_SERVER_PASSWORD"),
+			source:    source,
+			client:    &http.Client{Timeout: 15 * time.Second},
+		}, nil
+	case "hermes":
+		url := os.Getenv("HERMES_WEBHOOK_URL")
+		if url == "" {
+			return nil, fmt.Errorf("CHANNEL_SINK=hermes requires HERMES_WEBHOOK_URL (e.g. http://127.0.0.1:8644/webhooks/%s)", source)
 		}
-		return mattermostDest{Username: name}, nil
+		return &hermesSink{
+			url:    url,
+			secret: os.Getenv("HERMES_WEBHOOK_SECRET"),
+			source: source,
+			client: &http.Client{Timeout: 15 * time.Second},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown CHANNEL_SINK %q: want claude|opencode|hermes", os.Getenv("CHANNEL_SINK"))
 	}
-	if isMattermostID(target) {
-		return mattermostDest{UserID: target}, nil
-	}
-	return mattermostDest{}, fmt.Errorf("invalid MATTERMOST_TARGET %q: want @username, or a %d-character Mattermost user id", raw, mattermostIDLen)
 }
 
-// envelope renders the `<channel ...>` wrapper: every non-empty meta entry
-// becomes an attribute, sorted so the same event always renders identically.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// envelope renders the exact `<channel ...>` wrapper Claude Code puts around a
+// channel notification: every non-empty meta entry becomes an attribute.
 func envelope(source, content string, meta map[string]string) string {
 	var b strings.Builder
 	b.WriteString("<channel source=\"")
@@ -229,89 +120,177 @@ var xmlAttrEscaper = strings.NewReplacer(
 
 func xmlAttrEscape(s string) string { return xmlAttrEscaper.Replace(s) }
 
-// --- herdr: agent.prompt over the socket -------------------------------------
+// --- claude (default): MCP channel notification, unchanged behavior ----------
 
-// herdrSink hands the envelope to herdr, which submits it as session input to
-// whichever agent occupies the target pane. No shell and no subprocess are on
-// this path, so an envelope carrying `$(...)`, quotes, backticks or newlines
-// travels as one literal JSON string.
-type herdrSink struct {
-	driver  herdrDriver
-	target  string
-	timeout time.Duration
-	source  string
+type claudeSink struct{ out *stdoutWriter }
+
+func (s *claudeSink) deliver(content string, meta map[string]string) error {
+	s.out.notify("notifications/claude/channel", map[string]any{
+		"content": content,
+		"meta":    meta,
+	})
+	return nil
 }
 
-// herdrDefaultTimeoutMS is what the wait gets when HERDR_PROMPT_TIMEOUT_MS is
-// unset: long enough for an agent to finish a real turn, short enough that a
-// wedged one does not hold the drain loop past the next few polls.
-const herdrDefaultTimeoutMS = 120000
+// --- opencode: user-turn injection over HTTP ---------------------------------
 
-func (s *herdrSink) deliver(content string, meta map[string]string) error {
-	result := s.driver.promptAgent(context.Background(), s.target, envelope(s.source, content, meta), s.timeout)
-	if result.OK {
-		// Settled includes *blocked* (the agent stopped on a permission
-		// prompt), so this is evidence the tick was delivered, not proof it was
-		// acted on. Acking anyway is deliberate and everloop's design absorbs
-		// it: ticks coalesce, so the next delivery carries the catch-up count
-		// rather than the work being lost.
-		return nil
-	}
-	// Anything else leaves the message claimed-but-unacked: the spool reclaims
-	// it on the next poll and drainLoop stops the batch here to preserve order.
-	// The code is included because it is the difference that matters —
-	// `agent_not_found` means HERDR_TARGET names nobody (fix the config), while
-	// a bare message means herdr could not be reached (delivery unknown).
-	if result.Code != "" {
-		return fmt.Errorf("herdr agent prompt %s: %s: %s", s.target, result.Code, result.Error)
-	}
-	return fmt.Errorf("herdr agent prompt %s: %s", s.target, result.Error)
+type opencodeSink struct {
+	base      string
+	sessionID string // explicit override; skip resolution when set
+	title     string
+	directory string
+	username  string // opencode's own basic-auth envs; password empty = no auth
+	password  string
+	source    string
+	client    *http.Client
+
+	mu       sync.Mutex
+	resolved string
 }
 
-// --- mattermost: a DM from everloop's own account ----------------------------
-
-// mattermostSink posts the envelope as a direct message from everloop's own
-// Mattermost account to the recipient agent's. The wake is the recipient's own
-// mattermost-agents listener seeing a post somebody else wrote in a channel it
-// watches — which is why the sending identity must be a separate account, and
-// why the post is a DM: it reaches exactly one agent.
-//
-// No shell and no subprocess are on the delivery path, so an envelope carrying
-// `$(...)`, quotes, backticks or newlines travels as one literal JSON string.
-type mattermostSink struct {
-	driver  mattermostDriver
-	dest    mattermostDest
-	timeout time.Duration
-	source  string
+// do issues an authenticated request; opencode enables HTTP basic auth when
+// OPENCODE_SERVER_PASSWORD is set on the server.
+func (s *opencodeSink) do(method, path string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(method, s.base+path, body)
+	if err != nil {
+		return nil, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if s.password != "" {
+		req.SetBasicAuth(s.username, s.password)
+	}
+	return s.client.Do(req)
 }
 
-// mattermostDefaultTimeoutMS is what a delivery gets when
-// MATTERMOST_POST_TIMEOUT_MS is unset. It covers the whole operation, not one
-// request: on the first firing that is a token resolution (which can mean a
-// `secret` lookup against a password manager), a `/users/me`, possibly a
-// username lookup, a direct-channel create and the post. Every one of those
-// but the post is cached afterwards.
-const mattermostDefaultTimeoutMS = 30000
+type ocSession struct {
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Directory string `json:"directory"`
+}
 
-func (s *mattermostSink) deliver(content string, meta map[string]string) error {
-	result := s.driver.post(context.Background(), s.dest, mattermostBody(s.source, content, meta), s.timeout)
-	if result.OK {
-		// The post exists, so the recipient's listener will see it on its next
-		// poll. Like the herdr sink this is evidence of delivery, not proof the
-		// agent acted, and acking anyway is deliberate: ticks coalesce, so the
-		// next firing carries the catch-up count rather than the work being
-		// lost.
-		return nil
+func (s *opencodeSink) session() (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sessionID != "" {
+		return s.sessionID, nil
 	}
-	// Anything else leaves the message claimed-but-unacked: the spool reclaims
-	// it on the next poll and drainLoop stops the batch here to preserve order.
-	// The code is the difference that matters — Mattermost's own error id
-	// (`store.sql_user.missing_account.const` for a recipient who does not
-	// exist, `api.context.permissions.app_error` for a token that may not
-	// address them) says the config is wrong, while a bare message means the
-	// server could not be reached and the outcome is unknown.
-	if result.Code != "" {
-		return fmt.Errorf("mattermost post to %s: %s: %s", s.dest, result.Code, result.Error)
+	if s.resolved != "" {
+		return s.resolved, nil
 	}
-	return fmt.Errorf("mattermost post to %s: %s", s.dest, result.Error)
+	res, err := s.do(http.MethodGet, "/session", nil)
+	if err != nil {
+		return "", fmt.Errorf("opencode GET /session: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("opencode GET /session: HTTP %d", res.StatusCode)
+	}
+	var sessions []ocSession
+	if err := json.NewDecoder(res.Body).Decode(&sessions); err != nil {
+		return "", err
+	}
+	for _, sess := range sessions {
+		if sess.Title == s.title && (s.directory == "" || sess.Directory == s.directory) {
+			s.resolved = sess.ID
+			return sess.ID, nil
+		}
+	}
+	body, _ := json.Marshal(map[string]any{"title": s.title})
+	res2, err := s.do(http.MethodPost, "/session", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("opencode POST /session: %w", err)
+	}
+	defer res2.Body.Close()
+	if res2.StatusCode/100 != 2 {
+		return "", fmt.Errorf("opencode POST /session: HTTP %d", res2.StatusCode)
+	}
+	var created ocSession
+	if err := json.NewDecoder(res2.Body).Decode(&created); err != nil {
+		return "", err
+	}
+	s.resolved = created.ID
+	return created.ID, nil
+}
+
+func (s *opencodeSink) deliver(content string, meta map[string]string) error {
+	text := envelope(s.source, content, meta)
+	body, _ := json.Marshal(map[string]any{
+		"parts": []map[string]any{{"type": "text", "text": text}},
+	})
+	post := func(sessionID string) (*http.Response, error) {
+		return s.do(http.MethodPost, "/session/"+sessionID+"/prompt_async", bytes.NewReader(body))
+	}
+	sid, err := s.session()
+	if err != nil {
+		return err
+	}
+	res, err := post(sid)
+	if err != nil {
+		return fmt.Errorf("opencode prompt_async: %w", err)
+	}
+	if res.StatusCode == http.StatusNotFound && s.sessionID == "" {
+		// Cached session vanished (deleted/restarted server) — re-resolve once.
+		res.Body.Close()
+		s.mu.Lock()
+		s.resolved = ""
+		s.mu.Unlock()
+		if sid, err = s.session(); err != nil {
+			return err
+		}
+		if res, err = post(sid); err != nil {
+			return fmt.Errorf("opencode prompt_async: %w", err)
+		}
+	}
+	defer res.Body.Close()
+	if res.StatusCode/100 != 2 {
+		snippet, _ := io.ReadAll(io.LimitReader(res.Body, 300))
+		return fmt.Errorf("opencode prompt_async: HTTP %d: %s", res.StatusCode, strings.TrimSpace(string(snippet)))
+	}
+	return nil
+}
+
+// --- hermes: webhook route (spawns a run per event) --------------------------
+
+type hermesSink struct {
+	url    string
+	secret string
+	source string
+	client *http.Client
+}
+
+func (s *hermesSink) deliver(content string, meta map[string]string) error {
+	payload, _ := json.Marshal(map[string]any{
+		"body": envelope(s.source, content, meta),
+		"meta": meta,
+	})
+	req, err := http.NewRequest(http.MethodPost, s.url, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// Hermes dedups deliveries on this header for 1h — pairs with the spool's
+	// at-least-once redelivery to make sink crashes idempotent.
+	if id := meta["event_id"]; id != "" {
+		req.Header.Set("X-Request-ID", s.source+"-"+id)
+	}
+	if s.secret != "" {
+		// Generic V2: HMAC-SHA256 hex of "<timestamp>.<body>".
+		ts := strconv.FormatInt(time.Now().Unix(), 10)
+		mac := hmac.New(sha256.New, []byte(s.secret))
+		mac.Write([]byte(ts + "." + string(payload)))
+		req.Header.Set("X-Webhook-Timestamp", ts)
+		req.Header.Set("X-Webhook-Signature-V2", hex.EncodeToString(mac.Sum(nil)))
+	}
+	res, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("hermes webhook: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode/100 != 2 {
+		snippet, _ := io.ReadAll(io.LimitReader(res.Body, 300))
+		return fmt.Errorf("hermes webhook: HTTP %d: %s", res.StatusCode, strings.TrimSpace(string(snippet)))
+	}
+	return nil
 }

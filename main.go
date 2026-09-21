@@ -1,17 +1,9 @@
-// everloop: persistent loops for a coding agent, backed by whichever scheduler
-// the host actually has — systemd user timers, launchd agents, or everloop's own
-// scheduler daemon where there is no init system to borrow (containers).
+// everloop: persistent loops for Claude Code, backed by OS user timers
+// (systemd on Linux, launchd on macOS).
 //
-// Delivery reaches the agent as a Mattermost DM by default, or over herdr's
-// unix socket with CHANNEL_SINK=herdr — so the agent on the other end can be
-// claude, codex, omp, opencode or pi. See sink.go.
-//
-// One binary, four roles:
-//   - `everloop serve`      the MCP server the agent spawns (stdio), which also
-//     drains the spool into the configured sink
-//   - `everloop scheduler`  the supervised daemon that fires loops when the
-//     portable backend is live (see backend.go for the choice)
-//   - `everloop tick NAME`  one firing, spooled: what a timer executes
+// One binary, three roles:
+//   - `everloop serve`      the MCP channel server Claude Code spawns (stdio)
+//   - `everloop tick NAME`  what each OS timer executes: spool one firing
 //   - CLI loop management   create/list/update/delete/send, mirroring the MCP tools
 package main
 
@@ -23,31 +15,24 @@ import (
 
 const version = "0.1.0"
 
-const usage = `everloop %s - persistent loops for a coding agent
-(systemd user timers, launchd agents, or everloop's own scheduler daemon)
+const usage = `everloop %s - persistent loops for Claude Code, backed by OS timers
+(systemd user timers on Linux, launchd agents on macOS)
 
 Usage:
-  everloop serve                                 run as MCP server + spool drain (stdio)
-  everloop scheduler                             run the loop scheduler (portable backend; supervise this)
+  everloop serve                                 run as MCP channel server (stdio)
   everloop create NAME (--message M | --command C) (--every D | --calendar C) [--timeout T] [--disabled]
   everloop list
   everloop update NAME [--message M] [--command C] [--timeout T] [--every D] [--calendar C] [--enable|--disable]
   everloop delete NAME
   everloop send MESSAGE                          spool an ad-hoc message to the session
-  everloop tick NAME                             (called by the timer) spool one loop firing
+  everloop tick NAME                             (called by the OS timer) spool one loop firing
 
-Intervals: 90s, 5m, 1h30m, 2d (min 10s). Calendar: OnCalendar syntax such as
-"daily", "Mon..Fri 09:00" or "*-*-* 09:00:00" (the launchd and portable backends
-support a subset and reject the rest at create time).
+Intervals: 90s, 5m, 1h30m, 2d (min 10s). Calendar: systemd OnCalendar syntax
+(macOS supports a subset: hourly, daily, weekly, "*-*-* HH:MM", "Mon *-*-* HH:MM").
 With --command the loop is a watch: the command runs each firing and an event is
 spooled only when it writes to stdout (--timeout bounds it, default 60s). The
-command runs in the scheduler's environment, not a login shell.
-
-Backend: EVERLOOP_BACKEND=auto|systemd|launchd|portable (default auto — the OS
-timer manager when it is usable, else portable). "everloop list" names the live
-backend per loop. The portable backend fires nothing unless "everloop scheduler"
-is running.
-State: ~/.local/share/everloop (loop defs, spool, schedule state)
+command runs in the OS timer's environment, not a login shell.
+State: ~/.local/share/everloop
 Timers: ~/.config/systemd/user/everloop-*.timer (Linux)
         ~/Library/LaunchAgents/com.52labs.everloop.*.plist (macOS)
 `
@@ -61,19 +46,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
-	// Resolve the backend before doing anything: a mis-set EVERLOOP_BACKEND
-	// should fail on the command the operator just typed, not by scheduling
-	// somewhere they did not ask for.
-	if err := checkBackend(); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
-	}
 	var err error
 	switch os.Args[1] {
 	case "serve":
 		err = serve()
-	case "scheduler":
-		err = runScheduler()
 	case "tick":
 		if len(os.Args) != 3 {
 			err = fmt.Errorf("usage: everloop tick NAME")
@@ -99,7 +75,7 @@ func main() {
 			fmt.Println("Message spooled.")
 		}
 	case "version", "--version", "-v":
-		fmt.Printf("%s (backend: %s)\n", version, backendName())
+		fmt.Println(version)
 	case "help", "--help", "-h":
 		fmt.Printf(usage, version)
 	default:

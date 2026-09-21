@@ -9,32 +9,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 )
 
 // launchd backend: one LaunchAgent plist per loop under ~/Library/LaunchAgents,
 // labelled com.52labs.everloop[.<instance>].<name>. Interval loops use
 // StartInterval; calendar loops use StartCalendarInterval (a supported subset
 // of systemd's OnCalendar syntax — see parseCalendar).
-//
-// The native backend on macOS. launchd is part of the OS, so unlike systemd on
-// Linux it is never missing; the probe only guards against launchctl being
-// unreachable (a stripped container image, a locked-down sandbox).
-type launchdBackend struct{}
-
-func (launchdBackend) name() string { return "launchd" }
-
-func nativeBackend() backend { return launchdBackend{} }
-
-var nativeUnusable = sync.OnceValue(func() string {
-	if _, err := exec.LookPath("launchctl"); err != nil {
-		return "launchctl not found in PATH"
-	}
-	if _, err := launchctl("print", guiDomain()); err != nil {
-		return "no launchd GUI domain for uid " + strconv.Itoa(os.Getuid())
-	}
-	return ""
-})
 
 func agentsDir() string {
 	home, _ := os.UserHomeDir()
@@ -140,7 +120,7 @@ func parseCalendar(expr string) ([]calEntry, error) {
 	return append(entries, calEntry{"Hour", hour}, calEntry{"Minute", minute}), nil
 }
 
-func (launchdBackend) validateCalendar(expr string) error {
+func validateCalendar(expr string) error {
 	_, err := parseCalendar(expr)
 	return err
 }
@@ -227,7 +207,7 @@ func renderPlist(l *Loop, bin string) (string, error) {
 // installUnits writes the LaunchAgent plist for a loop and (re)bootstraps it.
 // Disabled loops keep their plist on disk but stay booted out; we never touch
 // `launchctl disable`, whose override DB outlives the plist.
-func (launchdBackend) installUnits(l *Loop) error {
+func installUnits(l *Loop) error {
 	bin, err := os.Executable()
 	if err != nil {
 		return err
@@ -258,7 +238,7 @@ func (launchdBackend) installUnits(l *Loop) error {
 	return nil
 }
 
-func (launchdBackend) removeUnits(name string) error {
+func removeUnits(name string) error {
 	launchctl("bootout", guiDomain()+"/"+loopLabel(name))
 	os.Remove(plistPath(name))
 	return nil
@@ -266,16 +246,16 @@ func (launchdBackend) removeUnits(name string) error {
 
 // timerStatus reports whether the LaunchAgent is loaded. launchd exposes no
 // next-fire time, so this is coarser than the systemd equivalent.
-func (launchdBackend) timerStatus(name string) string {
+func timerStatus(name string) string {
 	out, err := launchctl("print", guiDomain()+"/"+loopLabel(name))
 	if err != nil {
-		return "launchd: not loaded"
+		return "not loaded"
 	}
 	for _, line := range strings.Split(out, "\n") {
 		t := strings.TrimSpace(line)
 		if v, ok := strings.CutPrefix(t, "state = "); ok {
-			return "launchd: loaded (state = " + strings.TrimSpace(v) + ")"
+			return "loaded (state = " + strings.TrimSpace(v) + ")"
 		}
 	}
-	return "launchd: loaded"
+	return "loaded"
 }

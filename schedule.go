@@ -10,12 +10,11 @@ import (
 )
 
 // Schedule parsing and the high-level loop operations shared by every
-// platform backend. Each backend (systemd_linux.go, launchd_darwin.go,
-// portable.go) implements the same four operations, dispatched at runtime by
-// backend.go:
+// platform backend. Each backend (systemd_linux.go, launchd_darwin.go)
+// provides the same free functions:
 //
-//	installUnits(l *Loop) error    install/refresh the timer for a loop
-//	removeUnits(name string) error tear down the timer for a loop
+//	installUnits(l *Loop) error    install/refresh the OS timer for a loop
+//	removeUnits(name string) error tear down the OS timer for a loop
 //	timerStatus(name string) string  human-readable live timer state
 //	validateCalendar(expr string) error  check an OnCalendar expression
 

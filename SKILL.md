@@ -1,59 +1,38 @@
 ---
 name: everloop
 description: >
-  Manage persistent agent loops — recurring instructions that never expire
-  and survive session restarts and reboots, with no external service. They are
-  scheduled outside the session by whatever the host has: systemd user timers, a
-  launchd agent, or everloop's own scheduler daemon on a box (or container) with
-  no init system to borrow. Use when the user says "everloop", wants a
-  durable/persistent loop, a loop that "doesn't expire" or "outlives /loop", a
-  recurring task that survives restarts, asks how loops keep running without
-  systemd or inside a container, or asks to create/list/update/delete such loops
-  or push an ad-hoc message into a listening session.
+  Manage persistent Claude Code loops backed by systemd user timers — recurring
+  instructions that never expire and survive reboots, with no external service.
+  Use when the user says "everloop", wants a durable/persistent loop, a loop that
+  "doesn't expire" or "outlives /loop", a systemd-backed recurring task, or asks
+  to create/list/update/delete such loops or push an ad-hoc message into a
+  listening session.
 ---
 
-# everloop — persistent loops for a coding agent
+# everloop — persistent loops for Claude Code (systemd-backed)
 
-everloop replaces a harness's in-session scheduler (Claude Code's `/loop` expires
-after ~7 days; codex and omp have none) by moving the schedule **out of the
-session** and into something that outlives it, so a recurring instruction fires
-forever — across session restarts and reboots — with no external service.
-
-Delivery is how a firing reaches the session, and which transport is
-`CHANNEL_SINK`. By default it is **Mattermost**: everloop posts the firing as a
-direct message from its own `everloop` account to the recipient agent's, and the
-agent's own mattermost-agents listener wakes the session with it. Set
-`MATTERMOST_TARGET` (the recipient) and `MATTERMOST_PROFILE` (the sending
-identity). `CHANNEL_SINK=herdr` selects **herdr's** unix socket instead, which
-is still fully supported — herdr submits each firing as ordinary session input
-to whatever agent is in the target pane. Either way everloop is the same on
-claude, codex, omp, opencode and pi.
-
-What does the scheduling is picked at runtime: systemd user timers on Linux,
-launchd agents on macOS, and everloop's own `everloop scheduler` daemon where
-there is no usable init system (our agent workspace containers: no systemd, a
-read-only `/sys/fs/cgroup`, no Kubernetes API). The CLI and tools are identical
-on all three; only calendar expressions differ, and only by being a subset.
+everloop replaces the built-in `/loop` (whose CronCreate schedule expires after
+~7 days) with **systemd user timers**, so a recurring instruction fires forever
+— across session restarts and reboots — with no external service. (On macOS the
+same binary uses launchd agents under `~/Library/LaunchAgents/` instead; the
+CLI and tools are identical, but calendar expressions are limited to a subset —
+`hourly`, `daily`, `weekly`, `*-*-* HH:MM`, `Mon *-*-* HH:MM`.)
 
 - **Repo & source:** `~/projects/52labs/everloop`
 - **Binary:** `~/.local/bin/everloop` (rebuild with `cd ~/projects/52labs/everloop && go build -o ~/.local/bin/everloop .`)
-- **State:** loop defs + spool in `~/.local/share/everloop/`; timers in `~/.config/systemd/user/everloop-<name>.{timer,service}` (systemd) or `schedule/<name>.json` beside the spool (portable)
+- **State:** loop defs + spool in `~/.local/share/everloop/`; units in `~/.config/systemd/user/everloop-<name>.{timer,service}`
 
 ## How it works
 
-One Go binary, four roles:
+One Go binary, three roles:
 
-- `everloop serve` — the MCP server the agent spawns over stdio. It drains the
-  spool every ~2s and submits each firing to the configured sink as
-  `<channel source="everloop" ...>`, and exposes the loop management tools
-  below. It never schedules anything — if it did, loops would die with the
-  session, which is the whole problem everloop solves.
-- `everloop scheduler` — the supervised daemon that fires loops where systemd
-  and launchd are unavailable. One per data dir; logs to stdout; a missed
-  window catches up exactly once. Not needed when systemd is doing the work.
-- `everloop tick <name>` — one firing, spooled. Coalescing: at most one pending
-  tick per loop, so an outage never floods the session (repeat fires bump
-  `coalesced_count`).
+- `everloop serve` — the MCP **channel** server Claude Code spawns over stdio.
+  Declares `claude/channel`, drains the spool every ~2s, and pushes each firing
+  into the session as `<channel source="everloop" ...>`. Also exposes the loop
+  management tools below.
+- `everloop tick <name>` — what each OS timer runs; spools one firing.
+  Coalescing: at most one pending tick per loop, so an outage never floods the
+  session (repeat fires bump `coalesced_count`).
 - CLI — `create` / `list` / `update` / `delete` / `send`.
 
 Delivery is at-least-once (claim → notify → ack); each event carries an
@@ -92,11 +71,11 @@ repeats — handle every one, don't collapse them. `status="error"` /
 `status="timeout"` marks a body that is a diagnostic rather than an
 instruction.
 
-**Writing the command.** It runs in the scheduler's environment — the systemd
-user manager, launchd, or the scheduler daemon — and **never a login shell**:
-`~/.profile` is not sourced, so no fnox/mise/direnv activation and no
-interactive-shell secrets. Use absolute paths, have the script fetch its own
-secrets (`fnox get KEY`), and test it the way the timer will run it:
+**Writing the command.** It runs in the systemd user environment (launchd on
+macOS), **not a login shell** — `~/.profile` is not sourced, so no fnox/mise/
+direnv activation and no interactive-shell secrets. Use absolute paths, have
+the script fetch its own secrets (`fnox get KEY`), and test it the way the
+timer will run it:
 
 ```bash
 systemd-run --user --wait --pipe --quiet /full/path/to/your-command
@@ -118,7 +97,7 @@ everloop create reconcile --message "Reconcile the ledger and report anomalies."
 # command loop — silent unless the command prints something (see below)
 everloop create covers --command "/opt/stub/luma-watch.py check" --every 10m
 
-# calendar loop (OnCalendar syntax; a fire missed while off runs once, on return)
+# calendar loop (systemd OnCalendar syntax; a fire missed while off runs at next boot)
 everloop create standup --message "Draft the daily standup summary." --calendar "Mon..Fri 09:00"
 
 everloop list
@@ -136,110 +115,40 @@ Exactly one of `--every` / `--calendar` per loop, and at least one of
 lowercase letters, digits, hyphens (≤41 chars). Invalid intervals, timeouts and
 `OnCalendar` expressions are rejected up front.
 
-## Which backend is scheduling (and the container case)
-
-`everloop list` names it per loop, so start there when a loop "never fired":
-
-```
-- reconcile: every 1h | enabled=true | timer=systemd: active (next: Mon 2026-07-27 08:00:00 UTC)
-- sweep: every 10m | enabled=true | timer=portable: next Mon 2026-07-27 07:20:00 UTC — NO SCHEDULER RUNNING: start `everloop scheduler`
-```
-
-`portable` means there is no systemd/launchd to hold the loop, so **something
-must be running `everloop scheduler`** — a container's PID 1 supervisor, a
-tmux/`herdr` pane, whatever. It logs to stdout, refuses to start twice, stops
-cleanly on SIGTERM, and catches a missed window up exactly once rather than
-once per missed interval. If the status says NO SCHEDULER RUNNING, that is the
-bug: the loops are fine, nothing is firing them.
-
-`EVERLOOP_BACKEND=auto|systemd|launchd|portable` forces the choice; `auto`
-(default) probes for a usable systemd user manager and falls back. On the
-portable backend, calendar expressions are parsed in-process and anything
-outside the supported subset (see the repo README) is refused at create time —
-cron syntax like `17 * * * *` is not OnCalendar and will be rejected.
-
 ## Connecting a session to receive firings
 
-Loops only *deliver* into a session running `everloop serve`. Register it in the
-harness's project config — `.omp/mcp.json` for omp, `.mcp.json` for
-claude/codex — naming the instance, the recipient agent and the identity to
-post as:
+Loops only *deliver* into a session running the channel server. Register it in
+the project's `.mcp.json` (an example ships in the repo) or `~/.claude.json`:
 
 ```json
-{ "mcpServers": { "everloop": { "command": "/home/stephan/.local/bin/everloop", "args": ["serve"],
-  "env": { "EVERLOOP_INSTANCE": "clem", "CHANNEL_SINK": "mattermost",
-           "MATTERMOST_TARGET": "6q8b35xa87bt38zou5bksuyyrh",
-           "MATTERMOST_PROFILE": "/home/dev/.config/mattermost-agents/profiles/everloop.json" } } } }
+{ "mcpServers": { "everloop": { "command": "/home/stephan/.local/bin/everloop", "args": ["serve"] } } }
 ```
 
-- `MATTERMOST_TARGET` is the **recipient agent**: its 26-character Mattermost
-  user id, or `@username`. A bare name without the `@` is refused, because an id
-  is itself 26 legal username characters and guessing wrong DMs a stranger.
-- `MATTERMOST_PROFILE` is a mattermost-agents profile for the **sending**
-  identity — the shared `everloop` automation account, never the recipient's own
-  profile. A listener drops posts its own account wrote, so a firing sent as the
-  recipient would be delivered to nobody, silently; everloop refuses that config
-  at startup instead. There is deliberately no fallback to
-  `MATTERMOST_AGENT_CONFIG`, which on these boxes already points at the agent's
-  own profile.
-- The token comes from the profile the way mattermost-agents resolves it: the
-  `tokenEnv` variable if set, otherwise `secret <tokenSecret>`. everloop holds no
-  server URL and no token of its own.
-- Optional: `MATTERMOST_CONNECTION` (required only when the profile has more
-  than one connection) and `MATTERMOST_POST_TIMEOUT_MS` (default 30000).
+Channels are a research preview, so launch with the development flag:
 
-The firing arrives as a DM whose body is the usual
-`<channel source="everloop" ...>` envelope, clipped to the server's 16383-byte
-post bound if the content is bigger. `everloop` is a sender and reads nothing —
-agents must act on the firing, not reply in that conversation.
-
-To stay on herdr, say so explicitly — `HERDR_TARGET` on its own is no longer a
-complete config:
-
-```json
-{ "mcpServers": { "everloop": { "command": "/home/stephan/.local/bin/everloop", "args": ["serve"],
-  "env": { "EVERLOOP_INSTANCE": "clem", "CHANNEL_SINK": "herdr", "HERDR_TARGET": "clem" } } } }
+```bash
+claude --dangerously-load-development-channels server:everloop
 ```
-
-`HERDR_TARGET` should be the agent's **herdr name**, not a pane id: a name
-survives a restart, a pane id dies with the pane. No launch flag is needed on
-any harness on either transport — there is no channel plane to enable.
-
-**The default is mattermost.** A config from before that (`HERDR_TARGET` set, no
-`CHANNEL_SINK`) refuses at startup and names both remedies rather than quietly
-falling back. Any other `CHANNEL_SINK` value is refused too; `none` (or `tools`)
-exposes the tools and never drains.
-
-A tick only lands while the agent is alive. On mattermost the post is made
-regardless and the recipient's listener picks it up whenever it comes back — the
-wake is durable, but a session that never returns simply never reads it. On
-herdr, `agent.prompt` answers `agent_not_found` when the pane holds no agent and
-the message stays queued. That is what makes a `--message` loop safe as a
-liveness heartbeat and a `--command` loop unsafe for one — the latter runs in
-the timer, without the agent.
 
 On connect, the server drains any backlog first (the reconnect/replay path),
-then polls. Run one draining session per queue — two `serve` processes would
+then polls. Run one listening session per queue — two `serve` processes would
 race for the same spool.
 
 ## Notes
 
-- Linger is enabled on titan (`loginctl enable-linger` already done), so systemd
-  timers fire even while logged out. In a container the equivalent is simply
-  keeping `everloop scheduler` supervised.
-- Under systemd, intervals use `OnUnitActiveSec` (monotonic) and calendars use
-  `OnCalendar` with `Persistent=true` (catches a missed wall-clock fire up at
-  boot). The portable scheduler reproduces both, including the catch-up.
+- Linger is enabled on citadel (`loginctl enable-linger` already done), so
+  timers fire even while logged out.
+- Intervals use `OnUnitActiveSec` (monotonic); calendars use `OnCalendar` with
+  `Persistent=true` (catches up a missed wall-clock fire at boot).
 - Local-only, no network listener: anything that can run `everloop send` as the
-  user can put text in front of the agent — same trust boundary as the shell.
-- `EVERLOOP_DATA_DIR` overrides state location; `EVERLOOP_POLL_SECONDS` the spool
-  poll; `EVERLOOP_SCAN_SECONDS` the portable scheduler's scan.
+  user can put text in front of Claude — same trust boundary as the shell.
+- `EVERLOOP_DATA_DIR` overrides state location; `EVERLOOP_POLL_SECONDS` the poll
+  interval.
 - **Instances**: `EVERLOOP_INSTANCE=<name>` isolates a session's loops into
   their own data dir (`~/.local/share/everloop/<name>/`) and unit namespace
   (`everloop-<name>-<loop>`). Several orchestrators run concurrently this way —
   the 52labs (`bot`), `jessica` (linear), and `clem` sessions each set their own
   instance. Manage one from a shell with `EVERLOOP_INSTANCE=<name> everloop …`.
-  Unset = the default instance this skill drives. On the portable backend, run
-  one `everloop scheduler` per instance.
+  Unset = the default instance this skill drives.
 
 See `README.md` in the repo for architecture and delivery-semantics detail.
