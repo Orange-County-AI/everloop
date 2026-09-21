@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "everloop": {
-      "command": "/home/stephan/.local/bin/everloop",
+      "command": "everloop",
       "args": ["serve"]
     }
   }

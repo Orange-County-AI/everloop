@@ -59,15 +59,9 @@ func validateCalendar(expr string) error {
 	return nil
 }
 
-// installUnits writes the .timer/.service pair for a loop and reloads systemd.
-// The timer runs `everloop tick <name>`, which spools a message to the queue.
-func installUnits(l *Loop) error {
-	bin, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	bin, _ = filepath.EvalSymlinks(bin)
-
+// renderUnits builds the .service/.timer pair for a loop. The timer runs
+// `everloop tick <name>`, which spools a message to the queue.
+func renderUnits(l *Loop, bin string) (service, timer string, err error) {
 	var timerLines string
 	if l.Calendar != "" {
 		// Persistent=true: a missed calendar fire (machine off) runs on boot.
@@ -75,7 +69,7 @@ func installUnits(l *Loop) error {
 	} else {
 		d, err := parseEvery(l.Every)
 		if err != nil {
-			return err
+			return "", "", err
 		}
 		span := fmt.Sprintf("%ds", int(d.Seconds()))
 		// OnActiveSec anchors the first fire; OnUnitActiveSec repeats after it.
@@ -84,7 +78,10 @@ func installUnits(l *Loop) error {
 
 	// Bake the isolation env into the unit so the timer-fired `tick` resolves
 	// the same data dir this create used — without it, tick would read the
-	// default instance, fail to find the loop, and spool nothing.
+	// default instance, fail to find the loop, and spool nothing. The env var
+	// is written whether the instance came from EVERLOOP_INSTANCE or from
+	// `--instance`: instanceName() has already resolved the two, and a baked
+	// Environment= keeps existing units working unchanged.
 	var envLines string
 	if inst := instanceName(); inst != "" {
 		envLines += fmt.Sprintf("Environment=EVERLOOP_INSTANCE=%s\n", inst)
@@ -101,12 +98,12 @@ func installUnits(l *Loop) error {
 	if l.Command != "" {
 		d, err := parseTimeout(l.Timeout)
 		if err != nil {
-			return err
+			return "", "", err
 		}
 		svcLines = fmt.Sprintf("TimeoutStartSec=%ds\n", int(d.Seconds())+30)
 	}
 
-	service := fmt.Sprintf(`[Unit]
+	service = fmt.Sprintf(`[Unit]
 Description=everloop tick: %s%s
 
 [Service]
@@ -114,7 +111,7 @@ Type=oneshot
 %s%sExecStart=%s tick %s
 `, instanceLabel(), l.Name, envLines, svcLines, bin, l.Name)
 
-	timer := fmt.Sprintf(`[Unit]
+	timer = fmt.Sprintf(`[Unit]
 Description=everloop timer: %s%s
 
 [Timer]
@@ -123,6 +120,22 @@ Description=everloop timer: %s%s
 [Install]
 WantedBy=timers.target
 `, instanceLabel(), l.Name, timerLines)
+
+	return service, timer, nil
+}
+
+// installUnits writes the .timer/.service pair for a loop and reloads systemd.
+func installUnits(l *Loop) error {
+	bin, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	bin, _ = filepath.EvalSymlinks(bin)
+
+	service, timer, err := renderUnits(l, bin)
+	if err != nil {
+		return err
+	}
 
 	if err := os.MkdirAll(unitDir(), 0o755); err != nil {
 		return err

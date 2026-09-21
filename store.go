@@ -85,11 +85,36 @@ func (m QueueMsg) status() string {
 
 var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)
 
+// instanceFlag carries the global `--instance` flag, stripped from argv before
+// any subcommand parser runs (see splitInstanceFlag). It is kept separate from
+// the value so that `--instance ""` is a deliberate "use the default instance"
+// that still beats EVERLOOP_INSTANCE, rather than being indistinguishable from
+// an absent flag.
+var (
+	instanceFlag    string
+	instanceFlagSet bool
+)
+
 // instanceName isolates one everloop from another: several long-lived sessions
 // (each an MCP `serve`) must not share a spool or they would steal each other's
-// ticks. Set EVERLOOP_INSTANCE per session to give it its own data dir and
-// systemd unit namespace. Empty = the default (single-user) instance.
-func instanceName() string { return os.Getenv("EVERLOOP_INSTANCE") }
+// ticks. Select one with `--instance NAME` or EVERLOOP_INSTANCE=NAME to give it
+// its own data dir and systemd unit namespace; the flag wins when both are set.
+// Empty = the default (single-user) instance.
+func instanceName() string {
+	if instanceFlagSet {
+		return instanceFlag
+	}
+	return os.Getenv("EVERLOOP_INSTANCE")
+}
+
+// instanceSource names where the effective instance came from, so an invalid
+// one points at the thing the caller actually typed.
+func instanceSource() string {
+	if instanceFlagSet {
+		return "--instance"
+	}
+	return "EVERLOOP_INSTANCE"
+}
 
 // checkInstance validates the instance name, which becomes both a filesystem
 // path component and part of a systemd unit name.
@@ -98,7 +123,7 @@ func checkInstance() error {
 	if inst == "" || nameRe.MatchString(inst) {
 		return nil
 	}
-	return fmt.Errorf("invalid EVERLOOP_INSTANCE %q: must match %s", inst, nameRe)
+	return fmt.Errorf("invalid %s %q: must match %s", instanceSource(), inst, nameRe)
 }
 
 func dataDir() string {

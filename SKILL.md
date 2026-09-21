@@ -14,13 +14,11 @@ description: >
 everloop replaces the built-in `/loop` (whose CronCreate schedule expires after
 ~7 days) with **systemd user timers**, so a recurring instruction fires forever
 — across session restarts and reboots — with no external service. (On macOS the
-same binary uses launchd agents under `~/Library/LaunchAgents/` instead; the
-CLI and tools are identical, but calendar expressions are limited to a subset —
-`hourly`, `daily`, `weekly`, `*-*-* HH:MM`, `Mon *-*-* HH:MM`.)
+same binary uses launchd agents instead; the CLI and tools are identical, but
+calendar expressions are limited to a subset — `hourly`, `daily`, `weekly`,
+`*-*-* HH:MM`, `Mon *-*-* HH:MM`.)
 
-- **Repo & source:** `~/projects/52labs/everloop`
-- **Binary:** `~/.local/bin/everloop` (rebuild with `cd ~/projects/52labs/everloop && go build -o ~/.local/bin/everloop .`)
-- **State:** loop defs + spool in `~/.local/share/everloop/`; units in `~/.config/systemd/user/everloop-<name>.{timer,service}`
+Everything below runs the `everloop` binary on PATH.
 
 ## How it works
 
@@ -72,10 +70,10 @@ repeats — handle every one, don't collapse them. `status="error"` /
 instruction.
 
 **Writing the command.** It runs in the systemd user environment (launchd on
-macOS), **not a login shell** — `~/.profile` is not sourced, so no fnox/mise/
-direnv activation and no interactive-shell secrets. Use absolute paths, have
-the script fetch its own secrets (`fnox get KEY`), and test it the way the
-timer will run it:
+macOS), **not a login shell** — `~/.profile` is not sourced, so no mise/direnv
+activation and no interactive-shell secrets. Use absolute paths, have the
+script fetch its own secrets (on this fleet, `secret KEY`), and test it the way
+the timer will run it:
 
 ```bash
 systemd-run --user --wait --pipe --quiet /full/path/to/your-command
@@ -94,7 +92,7 @@ use the CLI — it is the same operations:
 # interval loop (90s, 5m, 1h30m, 2d — minimum 10s)
 everloop create reconcile --message "Reconcile the ledger and report anomalies." --every 1h
 
-# command loop — silent unless the command prints something (see below)
+# command loop — silent unless the command prints something (see above)
 everloop create covers --command "/opt/stub/luma-watch.py check" --every 10m
 
 # calendar loop (systemd OnCalendar syntax; a fire missed while off runs at next boot)
@@ -115,14 +113,45 @@ Exactly one of `--every` / `--calendar` per loop, and at least one of
 lowercase letters, digits, hyphens (≤41 chars). Invalid intervals, timeouts and
 `OnCalendar` expressions are rejected up front.
 
+## Instances
+
+An **instance** is a self-contained everloop: its own loop definitions, its own
+spool, and its own timer namespace (`everloop-<instance>-<loop>` on Linux). Two
+long-lived sessions that shared one spool would steal each other's firings, so
+each gets its own instance.
+
+Select one with the global `--instance NAME` flag — valid on every subcommand
+and anywhere in the argument list — or with `EVERLOOP_INSTANCE=NAME`. The flag
+wins when both are set; neither means the default instance.
+
+```bash
+everloop --instance <name> list
+EVERLOOP_INSTANCE=<name> everloop list     # same thing
+```
+
+**Use the same instance for the CLI and for `serve`.** A loop created in one
+instance is invisible to a session serving another. The instance is baked into
+each generated timer unit, so a timer-fired `tick` always lands in the instance
+that created the loop, whichever way you selected it.
+
 ## Connecting a session to receive firings
 
 Loops only *deliver* into a session running the channel server. Register it in
 the project's `.mcp.json` (an example ships in the repo) or `~/.claude.json`:
 
 ```json
-{ "mcpServers": { "everloop": { "command": "/home/stephan/.local/bin/everloop", "args": ["serve"] } } }
+{
+  "mcpServers": {
+    "everloop": {
+      "command": "everloop",
+      "args": ["serve", "--instance", "<name>"]
+    }
+  }
+}
 ```
+
+Drop the `--instance` pair for the default instance. Equivalently, pass it as
+an env block: `"args": ["serve"], "env": {"EVERLOOP_INSTANCE": "<name>"}`.
 
 Channels are a research preview, so launch with the development flag:
 
@@ -131,24 +160,23 @@ claude --dangerously-load-development-channels server:everloop
 ```
 
 On connect, the server drains any backlog first (the reconnect/replay path),
-then polls. Run one listening session per queue — two `serve` processes would
-race for the same spool.
+then polls. **Run one listening session per instance** — two `serve` processes
+on the same instance would race for the same spool.
 
 ## Notes
 
-- Linger is enabled on citadel (`loginctl enable-linger` already done), so
-  timers fire even while logged out.
 - Intervals use `OnUnitActiveSec` (monotonic); calendars use `OnCalendar` with
-  `Persistent=true` (catches up a missed wall-clock fire at boot).
+  `Persistent=true`, which catches up a wall-clock fire missed while the machine
+  was off. Note that enabling a calendar timer that has never run counts as a
+  missed fire, so it goes off once immediately.
+- **Calendar expressions carry no zone by default.** A systemd user manager
+  usually runs in UTC, so write the zone explicitly:
+  `--calendar "*-*-* 07:47 America/Los_Angeles"`.
+- On Linux, timers only fire while logged out if the user has linger enabled
+  (`loginctl enable-linger $USER`, once per host).
 - Local-only, no network listener: anything that can run `everloop send` as the
   user can put text in front of Claude — same trust boundary as the shell.
-- `EVERLOOP_DATA_DIR` overrides state location; `EVERLOOP_POLL_SECONDS` the poll
-  interval.
-- **Instances**: `EVERLOOP_INSTANCE=<name>` isolates a session's loops into
-  their own data dir (`~/.local/share/everloop/<name>/`) and unit namespace
-  (`everloop-<name>-<loop>`). Several orchestrators run concurrently this way —
-  the 52labs (`bot`), `jessica` (linear), and `clem` sessions each set their own
-  instance. Manage one from a shell with `EVERLOOP_INSTANCE=<name> everloop …`.
-  Unset = the default instance this skill drives.
+- `EVERLOOP_DATA_DIR` overrides the state location outright (instance and all);
+  `EVERLOOP_POLL_SECONDS` sets the poll interval.
 
 See `README.md` in the repo for architecture and delivery-semantics detail.

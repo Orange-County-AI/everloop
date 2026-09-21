@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 )
 
 const version = "0.1.0"
@@ -27,6 +28,12 @@ Usage:
   everloop send MESSAGE                          spool an ad-hoc message to the session
   everloop tick NAME                             (called by the OS timer) spool one loop firing
 
+Global:
+  --instance NAME    pick the instance to act on (its own data dir and timer
+                     namespace). Valid on every subcommand and anywhere in the
+                     argument list. Overrides EVERLOOP_INSTANCE; unset = the
+                     default instance.
+
 Intervals: 90s, 5m, 1h30m, 2d (min 10s). Calendar: systemd OnCalendar syntax
 (macOS supports a subset: hourly, daily, weekly, "*-*-* HH:MM", "Mon *-*-* HH:MM").
 With --command the loop is a watch: the command runs each firing and an event is
@@ -37,8 +44,53 @@ Timers: ~/.config/systemd/user/everloop-*.timer (Linux)
         ~/Library/LaunchAgents/com.52labs.everloop.*.plist (macOS)
 `
 
+// splitInstanceFlag pulls the global --instance out of the argument list before
+// any subcommand parser sees it, so it can appear anywhere: `everloop
+// --instance jessica list` and `everloop list --instance jessica` are the same
+// command, and `serve --instance jessica` lets an .mcp.json entry select an
+// instance with args instead of an env block. Both `--instance NAME` and
+// `--instance=NAME` are accepted (as is the single-dash spelling the flag
+// package allows), and a bare `--` ends the scan so a literal argument after it
+// is never eaten.
+func splitInstanceFlag(args []string) ([]string, error) {
+	rest := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return append(rest, args[i:]...), nil
+		}
+		name, ok := strings.CutPrefix(arg, "--")
+		if !ok {
+			name, ok = strings.CutPrefix(arg, "-")
+		}
+		if !ok {
+			rest = append(rest, arg)
+			continue
+		}
+		name, value, hasValue := strings.Cut(name, "=")
+		if name != "instance" {
+			rest = append(rest, arg)
+			continue
+		}
+		if !hasValue {
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("flag needs an argument: --instance")
+			}
+			i++
+			value = args[i]
+		}
+		instanceFlag, instanceFlagSet = value, true
+	}
+	return rest, nil
+}
+
 func main() {
-	if len(os.Args) < 2 {
+	args, err := splitInstanceFlag(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(2)
+	}
+	if len(args) == 0 {
 		fmt.Fprintf(os.Stderr, usage, version)
 		os.Exit(2)
 	}
@@ -46,32 +98,31 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
-	var err error
-	switch os.Args[1] {
+	switch args[0] {
 	case "serve":
 		err = serve()
 	case "tick":
-		if len(os.Args) != 3 {
+		if len(args) != 2 {
 			err = fmt.Errorf("usage: everloop tick NAME")
 		} else {
-			err = enqueueTick(os.Args[2])
+			err = enqueueTick(args[1])
 		}
 	case "create":
-		err = cmdCreate(os.Args[2:])
+		err = cmdCreate(args[1:])
 	case "list":
 		err = cmdList()
 	case "update":
-		err = cmdUpdate(os.Args[2:])
+		err = cmdUpdate(args[1:])
 	case "delete":
-		if len(os.Args) != 3 {
+		if len(args) != 2 {
 			err = fmt.Errorf("usage: everloop delete NAME")
-		} else if err = deleteLoop(os.Args[2]); err == nil {
-			fmt.Printf("Deleted loop %q.\n", os.Args[2])
+		} else if err = deleteLoop(args[1]); err == nil {
+			fmt.Printf("Deleted loop %q.\n", args[1])
 		}
 	case "send":
-		if len(os.Args) != 3 {
+		if len(args) != 2 {
 			err = fmt.Errorf("usage: everloop send MESSAGE")
-		} else if err = enqueueMessage(os.Args[2], nil); err == nil {
+		} else if err = enqueueMessage(args[1], nil); err == nil {
 			fmt.Println("Message spooled.")
 		}
 	case "version", "--version", "-v":
@@ -79,7 +130,7 @@ func main() {
 	case "help", "--help", "-h":
 		fmt.Printf(usage, version)
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n"+usage, os.Args[1], version)
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n"+usage, args[0], version)
 		os.Exit(2)
 	}
 	if err != nil {

@@ -48,18 +48,22 @@ go build -o ~/.local/bin/everloop .
 ```
 
 Register the channel server in `.mcp.json` (project) or `~/.claude.json`
-(user, use the absolute path):
+(user). `command` is the `everloop` binary on PATH — spell it absolutely if the
+launching process has a different PATH than your shell:
 
 ```json
 {
   "mcpServers": {
     "everloop": {
-      "command": "/home/stephan/.local/bin/everloop",
+      "command": "everloop",
       "args": ["serve"]
     }
   }
 }
 ```
+
+Add `--instance <name>` to `args` to serve a named instance — see
+[Multiple instances](#multiple-instances---instance--everloop_instance).
 
 Channels are a research preview, so launch with the development flag:
 
@@ -197,15 +201,15 @@ This has bitten us twice. The command is executed by the **systemd user
 manager** (launchd on macOS), not a login shell:
 
 - **`~/.profile`, `~/.bashrc` and `~/.bash_profile` are NOT sourced.** Anything
-  they export — `fnox activate`, mise activation, `direnv`, a project `venv` —
-  is absent.
-- **PATH is the unit's PATH, not yours.** On this machine
-  `~/.config/systemd/user/service.d/10-path.conf` puts `~/.local/bin` and
+  they export — mise or direnv activation, a project `venv`, a secrets-manager
+  shim — is absent.
+- **PATH is the unit's PATH, not yours.** A drop-in such as
+  `~/.config/systemd/user/service.d/10-path.conf` can put `~/.local/bin` and
   `~/.local/share/mise/shims` on PATH for every user service, so mise-managed
-  tools (`uv`, `bun`, `fnox`, `node`) do resolve. On a machine without that
-  drop-in they will not.
+  tools (`uv`, `bun`, `node`) resolve. On a machine without that drop-in they
+  will not.
 - Secrets that live in your interactive environment are not there either. Have
-  the script fetch them itself (`fnox get KEY`) rather than assuming `$KEY`.
+  the script fetch its own secrets rather than assuming `$KEY` is exported.
 
 A command that works pasted into a terminal can still fail under the timer, and
 before this feature it failed *invisibly* — a script died with
@@ -338,33 +342,58 @@ route's prompt template is just `{body}`.
   (each message still goes to exactly one of them). To run **several**
   independent orchestrators at once, give each its own instance.
 
-## Multiple instances (`EVERLOOP_INSTANCE`)
+## Multiple instances (`--instance` / `EVERLOOP_INSTANCE`)
 
 Several long-lived sessions (e.g. distinct Claude Code orchestrators) can each
-own their own loops by setting `EVERLOOP_INSTANCE=<name>` on the `serve`
-process. An instance gets:
+own their own loops by naming an instance. An instance gets:
 
 - its own data dir: `~/.local/share/everloop/<name>/`
+- its own spool, so two sessions never steal each other's firings
 - its own timer namespace: `everloop-<name>-<loop>.{timer,service}` on Linux,
   `com.52labs.everloop.<name>.<loop>.plist` on macOS
 
-The instance is baked into each generated timer (`Environment=` /
-`EnvironmentVariables`), so the timer-fired `tick` resolves the same data dir
-the `create` used. Loop names never collide across instances.
+Pick one two ways, and the flag wins when both are set:
+
+- `--instance <name>` — a **global** flag: valid on every subcommand (`create`,
+  `list`, `update`, `delete`, `send`, `tick`, `serve`) and anywhere in the
+  argument list, so `everloop --instance clem list` and
+  `everloop list --instance clem` are the same command. `--instance=<name>`
+  works too, and `--instance ""` is an explicit "the default instance" that
+  overrides an inherited env var.
+- `EVERLOOP_INSTANCE=<name>` in the environment.
+
+Whichever you use, the resolved instance is baked into each generated timer as
+`Environment=EVERLOOP_INSTANCE=<name>` (`EnvironmentVariables` on macOS), so
+the timer-fired `tick` resolves the same data dir the `create` used. Loop names
+never collide across instances.
+
+An invalid name is rejected before anything touches disk — it becomes both a
+filesystem path component and part of a unit name, so it must match
+`^[a-z0-9][a-z0-9-]{0,40}$`. The error names whichever of `--instance` /
+`EVERLOOP_INSTANCE` you actually set.
 
 Register it per session in `.mcp.json` (or `--mcp-config`):
 
 ```json
 { "mcpServers": { "everloop": {
-  "command": "/home/stephan/.local/bin/everloop", "args": ["serve"],
+  "command": "everloop", "args": ["serve", "--instance", "clem"] } } }
+```
+
+The env form still works, if you prefer it:
+
+```json
+{ "mcpServers": { "everloop": {
+  "command": "everloop", "args": ["serve"],
   "env": { "EVERLOOP_INSTANCE": "clem" } } } }
 ```
 
-To manage an instance's loops from a shell, set the same env:
+To manage that instance's loops from a shell, name the same instance:
 
 ```bash
-EVERLOOP_INSTANCE=clem everloop list
+everloop --instance clem list
+EVERLOOP_INSTANCE=clem everloop list    # equivalent
 ```
 
-An unset `EVERLOOP_INSTANCE` is the default instance (`~/.local/share/everloop/`,
-units `everloop-<loop>`), which is what the `/everloop` skill uses.
+Unnamed is the default instance (`~/.local/share/everloop/`, units
+`everloop-<loop>`). `EVERLOOP_DATA_DIR`, if set, overrides the data location
+outright and the instance no longer affects it — only the unit namespace.
